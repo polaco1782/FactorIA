@@ -1,0 +1,15 @@
+{
+  "name": "factoria",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "asio",
+    {
+      "name": "cpp-httplib",
+      "default-features": false
+    },
+    "nlohmann-json",
+    "openssl",
+    "wxwidgets"
+  ]
+}
+

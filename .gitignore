@@ -1,0 +1,11 @@
+.vs/
+build/
+out/
+x64/
+[Dd]ebug/
+[Rr]elease/
+packages/
+vcpkg_installed/
+*.user
+*.VC.db
+*.VC.VC.opendb
