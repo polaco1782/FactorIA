@@ -14,6 +14,7 @@
 #include <FactorIA/RconClient.h>
 
 class wxButton;
+class wxChoice;
 class wxNotebook;
 class wxSpinCtrl;
 class wxStaticText;
@@ -29,6 +30,7 @@ public:
 
 private:
     void BuildUi();
+    void UpdateAiProviderControls();
     void LoadSettingsIntoControls();
     AppSettings ReadSettingsFromControls() const;
     void SaveSettings();
@@ -56,6 +58,10 @@ private:
     wxTextCtrl* rconPassword_{};
     wxTextCtrl* llamaUrl_{};
     wxTextCtrl* llamaModel_{};
+    wxChoice* aiProvider_{};
+    wxTextCtrl* openRouterApiKey_{};
+    wxTextCtrl* openRouterModel_{};
+    wxTextCtrl* factorioUserDataPath_{};
     wxStaticText* llamaStatus_{};
     wxButton* llamaTestButton_{};
     wxStaticText* rconStatus_{};

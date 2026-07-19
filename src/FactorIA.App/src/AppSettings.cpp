@@ -22,6 +22,15 @@ std::filesystem::path UserConfigDirectory()
 }
 }
 
+AppSettings::AppSettings()
+{
+#ifdef _WIN32
+    factorioUserDataPath = UserConfigDirectory() / "Factorio";
+#else
+    factorioUserDataPath = UserConfigDirectory() / ".factorio";
+#endif
+}
+
 std::filesystem::path AppSettings::SettingsPath()
 {
     return UserConfigDirectory() / "FactorIA" / "settings.json";
@@ -44,6 +53,10 @@ AppSettings AppSettings::Load()
     settings.rconPassword = value.value("rcon_password", settings.rconPassword);
     settings.llamaUrl = value.value("llama_url", settings.llamaUrl);
     settings.llamaModel = value.value("llama_model", settings.llamaModel);
+    settings.aiProvider = value.value("ai_provider", settings.aiProvider);
+    settings.openRouterApiKey = value.value("openrouter_api_key", settings.openRouterApiKey);
+    settings.openRouterModel = value.value("openrouter_model", settings.openRouterModel);
+    settings.factorioUserDataPath = value.value("factorio_user_data_path", settings.factorioUserDataPath.string());
     return settings;
 }
 
@@ -62,8 +75,11 @@ void AppSettings::Save() const
         {"rcon_password", rconPassword},
         {"llama_url", llamaUrl},
         {"llama_model", llamaModel},
+        {"ai_provider", aiProvider},
+        {"openrouter_api_key", openRouterApiKey},
+        {"openrouter_model", openRouterModel},
+        {"factorio_user_data_path", factorioUserDataPath.string()},
     };
     output << value.dump(2) << '\n';
 }
 }
-

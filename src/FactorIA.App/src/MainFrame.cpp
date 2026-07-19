@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include <wx/button.h>
+#include <wx/choice.h>
 #include <wx/datetime.h>
 #include <wx/notebook.h>
 #include <wx/panel.h>
@@ -30,6 +31,20 @@ wxString FromPath(const std::filesystem::path& value)
 #else
     return wxString::FromUTF8(value.string());
 #endif
+}
+
+constexpr const char* OpenRouterUrl = "https://openrouter.ai/api/v1";
+
+LlamaClient CreateAiClient(const AppSettings& settings)
+{
+    if (settings.aiProvider == "openrouter")
+        return LlamaClient(OpenRouterUrl, settings.openRouterModel, settings.openRouterApiKey);
+    return LlamaClient(settings.llamaUrl, settings.llamaModel);
+}
+
+std::string AiProviderName(const AppSettings& settings)
+{
+    return settings.aiProvider == "openrouter" ? "OpenRouter" : "llama.cpp";
 }
 }
 
@@ -84,12 +99,15 @@ void MainFrame::BuildUi()
     rconPort_ = new wxSpinCtrl(connectionPanel, wxID_ANY);
     rconPort_->SetRange(1, 65535);
     rconPassword_ = new wxTextCtrl(connectionPanel, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize, wxTE_PASSWORD);
+    factorioUserDataPath_ = new wxTextCtrl(connectionPanel, wxID_ANY);
     factorioGrid->Add(new wxStaticText(connectionPanel, wxID_ANY, "Host"), 0, wxALIGN_CENTER_VERTICAL);
     factorioGrid->Add(rconHost_, 1, wxEXPAND);
     factorioGrid->Add(new wxStaticText(connectionPanel, wxID_ANY, "Port"), 0, wxALIGN_CENTER_VERTICAL);
     factorioGrid->Add(rconPort_, 1, wxEXPAND);
     factorioGrid->Add(new wxStaticText(connectionPanel, wxID_ANY, "Password"), 0, wxALIGN_CENTER_VERTICAL);
     factorioGrid->Add(rconPassword_, 1, wxEXPAND);
+    factorioGrid->Add(new wxStaticText(connectionPanel, wxID_ANY, "User data directory"), 0, wxALIGN_CENTER_VERTICAL);
+    factorioGrid->Add(factorioUserDataPath_, 1, wxEXPAND);
     factorioBox->Add(factorioGrid, 0, wxEXPAND | wxALL, 10);
 
     auto* stateRow = new wxBoxSizer(wxHORIZONTAL);
@@ -103,19 +121,31 @@ void MainFrame::BuildUi()
     stateRow->Add(testButton_);
     factorioBox->Add(stateRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
 
-    auto* llamaBox = new wxStaticBoxSizer(wxVERTICAL, connectionPanel, "llama.cpp");
+    auto* llamaBox = new wxStaticBoxSizer(wxVERTICAL, connectionPanel, "AI provider");
     auto* llamaGrid = new wxFlexGridSizer(2, 8, 10);
     llamaGrid->AddGrowableCol(1, 1);
     llamaUrl_ = new wxTextCtrl(connectionPanel, wxID_ANY);
     llamaModel_ = new wxTextCtrl(connectionPanel, wxID_ANY);
-    llamaGrid->Add(new wxStaticText(connectionPanel, wxID_ANY, "Base URL"), 0, wxALIGN_CENTER_VERTICAL);
+    aiProvider_ = new wxChoice(connectionPanel, wxID_ANY);
+    aiProvider_->Append("llama.cpp (local)");
+    aiProvider_->Append("OpenRouter");
+    openRouterApiKey_ = new wxTextCtrl(
+        connectionPanel, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize, wxTE_PASSWORD);
+    openRouterModel_ = new wxTextCtrl(connectionPanel, wxID_ANY);
+    llamaGrid->Add(new wxStaticText(connectionPanel, wxID_ANY, "Provider"), 0, wxALIGN_CENTER_VERTICAL);
+    llamaGrid->Add(aiProvider_, 1, wxEXPAND);
+    llamaGrid->Add(new wxStaticText(connectionPanel, wxID_ANY, "llama.cpp Base URL"), 0, wxALIGN_CENTER_VERTICAL);
     llamaGrid->Add(llamaUrl_, 1, wxEXPAND);
-    llamaGrid->Add(new wxStaticText(connectionPanel, wxID_ANY, "Model"), 0, wxALIGN_CENTER_VERTICAL);
+    llamaGrid->Add(new wxStaticText(connectionPanel, wxID_ANY, "llama.cpp Model"), 0, wxALIGN_CENTER_VERTICAL);
     llamaGrid->Add(llamaModel_, 1, wxEXPAND);
+    llamaGrid->Add(new wxStaticText(connectionPanel, wxID_ANY, "OpenRouter API key"), 0, wxALIGN_CENTER_VERTICAL);
+    llamaGrid->Add(openRouterApiKey_, 1, wxEXPAND);
+    llamaGrid->Add(new wxStaticText(connectionPanel, wxID_ANY, "OpenRouter Model"), 0, wxALIGN_CENTER_VERTICAL);
+    llamaGrid->Add(openRouterModel_, 1, wxEXPAND);
     llamaBox->Add(llamaGrid, 0, wxEXPAND | wxALL, 10);
     auto* llamaStateRow = new wxBoxSizer(wxHORIZONTAL);
     llamaStatus_ = new wxStaticText(connectionPanel, wxID_ANY, "Not tested");
-    llamaTestButton_ = new wxButton(connectionPanel, wxID_ANY, "Test llama.cpp");
+    llamaTestButton_ = new wxButton(connectionPanel, wxID_ANY, "Test AI provider");
     llamaStateRow->Add(llamaStatus_, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
     llamaStateRow->Add(llamaTestButton_);
     llamaBox->Add(llamaStateRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
@@ -167,6 +197,7 @@ void MainFrame::BuildUi()
     disconnectButton_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { DisconnectRcon(); });
     testButton_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { TestRcon(); });
     llamaTestButton_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { TestLlama(); });
+    aiProvider_->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { UpdateAiProviderControls(); });
     agentRunButton_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { RunAgent(); });
     agentStopButton_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { StopAgent(); });
     agentRunButton_->Disable();
@@ -180,6 +211,21 @@ void MainFrame::LoadSettingsIntoControls()
     rconPassword_->SetValue(FromUtf8(settings_.rconPassword));
     llamaUrl_->SetValue(FromUtf8(settings_.llamaUrl));
     llamaModel_->SetValue(FromUtf8(settings_.llamaModel));
+    aiProvider_->SetSelection(settings_.aiProvider == "openrouter" ? 1 : 0);
+    openRouterApiKey_->SetValue(FromUtf8(settings_.openRouterApiKey));
+    openRouterModel_->SetValue(FromUtf8(settings_.openRouterModel));
+    factorioUserDataPath_->SetValue(FromPath(settings_.factorioUserDataPath));
+    UpdateAiProviderControls();
+}
+
+void MainFrame::UpdateAiProviderControls()
+{
+    const auto openRouter = aiProvider_->GetSelection() == 1;
+    llamaUrl_->Enable(!openRouter);
+    llamaModel_->Enable(!openRouter);
+    openRouterApiKey_->Enable(openRouter);
+    openRouterModel_->Enable(openRouter);
+    llamaStatus_->SetLabel("Not tested");
 }
 
 AppSettings MainFrame::ReadSettingsFromControls() const
@@ -190,12 +236,26 @@ AppSettings MainFrame::ReadSettingsFromControls() const
     result.rconPassword = rconPassword_->GetValue().ToStdString();
     result.llamaUrl = llamaUrl_->GetValue().ToStdString();
     result.llamaModel = llamaModel_->GetValue().ToStdString();
+    result.aiProvider = aiProvider_->GetSelection() == 1 ? "openrouter" : "llama_cpp";
+    result.openRouterApiKey = openRouterApiKey_->GetValue().ToStdString();
+    result.openRouterModel = openRouterModel_->GetValue().ToStdString();
+#ifdef _WIN32
+    result.factorioUserDataPath = std::filesystem::path(factorioUserDataPath_->GetValue().ToStdWstring());
+#else
+    result.factorioUserDataPath = std::filesystem::path(factorioUserDataPath_->GetValue().ToStdString());
+#endif
     if (result.rconHost.empty())
         throw std::runtime_error("Factorio RCON host cannot be empty");
     if (result.rconPassword.empty())
         throw std::runtime_error("Factorio RCON password cannot be empty");
-    if (result.llamaUrl.empty())
+    if (result.aiProvider == "llama_cpp" && result.llamaUrl.empty())
         throw std::runtime_error("llama.cpp base URL cannot be empty");
+    if (result.aiProvider == "openrouter" && result.openRouterApiKey.empty())
+        throw std::runtime_error("OpenRouter API key cannot be empty");
+    if (result.aiProvider == "openrouter" && result.openRouterModel.empty())
+        throw std::runtime_error("OpenRouter model cannot be empty");
+    if (result.factorioUserDataPath.empty())
+        throw std::runtime_error("Factorio user data directory cannot be empty");
     return result;
 }
 
@@ -280,16 +340,16 @@ void MainFrame::TestLlama()
     }
     catch (const std::exception& error)
     {
-        AppendLog("Cannot test llama.cpp: " + FromUtf8(error.what()));
+        AppendLog("Cannot test AI provider: " + FromUtf8(error.what()));
         return;
     }
 
     llamaStatus_->SetLabel("Testing...");
-    StartWork("Testing llama.cpp", [this, requested](std::stop_token) {
-        LlamaClient(requested.llamaUrl, requested.llamaModel).CheckHealth();
-        CallAfter([this] {
+    StartWork("Testing " + AiProviderName(requested), [this, requested](std::stop_token) {
+        CreateAiClient(requested).CheckHealth();
+        CallAfter([this, provider = FromUtf8(AiProviderName(requested))] {
             llamaStatus_->SetLabel("Ready");
-            AppendLog("llama.cpp is ready");
+            AppendLog(provider + " is ready");
         });
     });
 }
@@ -326,8 +386,8 @@ void MainFrame::RunAgent()
             if (!rconClient_ || !rconClient_->IsConnected())
                 throw std::runtime_error("Factorio RCON disconnected during the agent run");
             return rconClient_->Execute(command);
-        });
-        AgentController controller(LlamaClient(requested.llamaUrl, requested.llamaModel), tools);
+        }, requested.factorioUserDataPath);
+        AgentController controller(CreateAiClient(requested), tools);
         const auto result = controller.Run(objective, maximumRounds, stopToken, [this](const std::string& trace) {
             CallAfter([this, text = FromUtf8(trace)] { AppendLog(text); });
         });
@@ -347,7 +407,7 @@ void MainFrame::StopAgent()
     {
         worker_.request_stop();
         agentStatus_->SetLabel("Stopping...");
-        AppendLog("Stop requested; an active llama.cpp HTTP request must finish before cancellation completes");
+        AppendLog("Stop requested; an active AI HTTP request must finish before cancellation completes");
     }
 }
 

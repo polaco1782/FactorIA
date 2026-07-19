@@ -24,7 +24,7 @@ struct LlamaTurn
 class LlamaClient
 {
 public:
-    LlamaClient(std::string baseUrl, std::string model);
+    LlamaClient(std::string baseUrl, std::string model, std::string bearerToken = {});
 
     void CheckHealth() const;
     LlamaTurn Complete(
@@ -40,9 +40,11 @@ private:
 
     static Endpoint ParseEndpoint(const std::string& baseUrl);
     std::string ChatPath() const;
+    std::string KeyPath() const;
+    [[nodiscard]] bool IsOpenRouter() const noexcept;
 
     Endpoint endpoint_;
     std::string model_;
+    std::string bearerToken_;
 };
 }
-

@@ -1,13 +1,16 @@
 #include <FactorIA/FactorioTools.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #include <limits>
 #include <regex>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace factoria
 {
@@ -99,10 +102,32 @@ json ParseFactorioJson(const std::string& response)
         throw std::runtime_error("Factorio command failed: " + value.value("error", "unknown Lua error"));
     return value.value("result", json{});
 }
+
+std::string Base64Encode(const std::vector<unsigned char>& input)
+{
+    static constexpr std::string_view alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string output;
+    output.reserve(((input.size() + 2U) / 3U) * 4U);
+    for (std::size_t offset = 0; offset < input.size(); offset += 3U)
+    {
+        const auto remaining = input.size() - offset;
+        const auto first = static_cast<unsigned int>(input[offset]);
+        const auto second = remaining > 1U ? static_cast<unsigned int>(input[offset + 1U]) : 0U;
+        const auto third = remaining > 2U ? static_cast<unsigned int>(input[offset + 2U]) : 0U;
+        const auto packed = (first << 16U) | (second << 8U) | third;
+        output.push_back(alphabet[(packed >> 18U) & 0x3fU]);
+        output.push_back(alphabet[(packed >> 12U) & 0x3fU]);
+        output.push_back(remaining > 1U ? alphabet[(packed >> 6U) & 0x3fU] : '=');
+        output.push_back(remaining > 2U ? alphabet[packed & 0x3fU] : '=');
+    }
+    return output;
+}
 }
 
-FactorioTools::FactorioTools(CommandExecutor executeCommand)
-    : executeCommand_(std::move(executeCommand))
+FactorioTools::FactorioTools(CommandExecutor executeCommand, std::filesystem::path factorioUserDataPath)
+    : executeCommand_(std::move(executeCommand)),
+      factorioUserDataPath_(std::move(factorioUserDataPath))
 {
     if (!executeCommand_)
         throw std::runtime_error("FactorioTools requires an RCON command executor");
@@ -123,6 +148,18 @@ FactorioTools::FactorioTools(CommandExecutor executeCommand)
                 {"type", "object"},
                 {"properties", {{"radius", {{"type", "number"}, {"minimum", 1.0}, {"maximum", 128.0}}}}},
                 {"required", {"radius"}},
+                {"additionalProperties", false},
+            }),
+        FunctionTool(
+            "find_resource_patches",
+            "Survey a large generated area for resource entities and return the nearest grouped patch regions with exact walking targets. Use resource='iron-ore', 'copper-ore', 'coal', 'stone', 'uranium-ore', or 'any'. Prefer this over wandering when locating ore.",
+            {
+                {"type", "object"},
+                {"properties", {
+                    {"resource", {{"type", "string"}, {"minLength", 1}, {"maxLength", 128}}},
+                    {"radius", {{"type", "number"}, {"minimum", 32.0}, {"maximum", 2048.0}}},
+                }},
+                {"required", {"resource", "radius"}},
                 {"additionalProperties", false},
             }),
         FunctionTool(
@@ -155,6 +192,19 @@ FactorioTools::FactorioTools(CommandExecutor executeCommand)
             "stop_walking",
             "Stop player walking immediately.",
             EmptyParameters()),
+        FunctionTool(
+            "take_screenshot",
+            "Capture the visible Factorio world centered on the player and inspect the resulting image. Requires non-headless Factorio, access to its user data directory, and a vision-capable llama.cpp model.",
+            {
+                {"type", "object"},
+                {"properties", {
+                    {"width", {{"type", "integer"}, {"minimum", 320}, {"maximum", 1280}}},
+                    {"height", {{"type", "integer"}, {"minimum", 240}, {"maximum", 960}}},
+                    {"zoom", {{"type", "number"}, {"minimum", 0.25}, {"maximum", 2.0}}},
+                }},
+                {"required", {"width", "height", "zoom"}},
+                {"additionalProperties", false},
+            }),
         FunctionTool(
             "mine_entity",
             "Mine the entity at exact map coordinates using normal player mining over time. The player must first be within reach.",
@@ -207,6 +257,11 @@ json FactorioTools::Execute(const std::string& name, const json& arguments, std:
         RejectUnknownArguments(arguments, {"radius"});
         return GetNearbyEntities(arguments);
     }
+    if (name == "find_resource_patches")
+    {
+        RejectUnknownArguments(arguments, {"resource", "radius"});
+        return FindResourcePatches(arguments);
+    }
     if (name == "walk")
     {
         RejectUnknownArguments(arguments, {"direction", "duration_seconds"});
@@ -221,6 +276,11 @@ json FactorioTools::Execute(const std::string& name, const json& arguments, std:
     {
         RejectUnknownArguments(arguments, {});
         return StopWalking();
+    }
+    if (name == "take_screenshot")
+    {
+        RejectUnknownArguments(arguments, {"width", "height", "zoom"});
+        return TakeScreenshot(arguments, stopToken);
     }
     if (name == "mine_entity")
     {
@@ -251,7 +311,8 @@ json FactorioTools::GetGameState() const
         "local p=game.connected_players[1] if not p then error('No connected player') end "
         "return {tick=game.tick,player={name=p.name,position={x=p.position.x,y=p.position.y},"
         "walking=p.walking_state.walking,direction=p.walking_state.direction},"
-        "crafting_queue_size=p.crafting_queue_size}");
+        "crafting_queue_size=p.crafting_queue_size,"
+        "bridge_mod_available=remote.interfaces['factoria_bridge']~=nil}");
 }
 
 json FactorioTools::GetInventory() const
@@ -281,6 +342,43 @@ json FactorioTools::GetNearbyEntities(const json& arguments) const
         "coordinate_hint='positive x is east; positive y is south',entities=entities}");
 }
 
+json FactorioTools::FindResourcePatches(const json& arguments) const
+{
+    const auto resource = RequiredPrototypeName(arguments, "resource");
+    const auto radius = RequiredNumber(arguments, "radius", 32.0, 2048.0);
+    const auto nameFilter = resource == "any"
+        ? std::string{}
+        : " filter.name=\"" + resource + "\" ";
+    return ExecuteJson(
+        "local p=game.connected_players[1] if not p then error('No connected player') end "
+        "local filter={position=p.position,radius=" + std::to_string(radius) + ",type='resource'} " +
+        nameFilter +
+        "local found=p.surface.find_entities_filtered(filter) local cell_size=32 local grouped={} "
+        "for _,e in pairs(found) do "
+        "local cell_x=math.floor(e.position.x/cell_size) local cell_y=math.floor(e.position.y/cell_size) "
+        "local key=e.name..':'..cell_x..':'..cell_y local patch=grouped[key] "
+        "local dx=e.position.x-p.position.x local dy=e.position.y-p.position.y local distance=math.sqrt(dx*dx+dy*dy) "
+        "if not patch then patch={resource=e.name,count=0,total_amount=0,sum_x=0,sum_y=0,"
+        "nearest_distance=distance,nearest_position={x=e.position.x,y=e.position.y},"
+        "bounds={left=e.position.x,right=e.position.x,top=e.position.y,bottom=e.position.y}} grouped[key]=patch end "
+        "patch.count=patch.count+1 patch.total_amount=patch.total_amount+(e.amount or 0) "
+        "patch.sum_x=patch.sum_x+e.position.x patch.sum_y=patch.sum_y+e.position.y "
+        "patch.bounds.left=math.min(patch.bounds.left,e.position.x) patch.bounds.right=math.max(patch.bounds.right,e.position.x) "
+        "patch.bounds.top=math.min(patch.bounds.top,e.position.y) patch.bounds.bottom=math.max(patch.bounds.bottom,e.position.y) "
+        "if distance<patch.nearest_distance then patch.nearest_distance=distance "
+        "patch.nearest_position={x=e.position.x,y=e.position.y} end end "
+        "local patches={} for _,patch in pairs(grouped) do "
+        "patch.center={x=patch.sum_x/patch.count,y=patch.sum_y/patch.count} "
+        "patch.sum_x=nil patch.sum_y=nil "
+        "patch.delta={x=patch.nearest_position.x-p.position.x,y=patch.nearest_position.y-p.position.y} "
+        "patches[#patches+1]=patch end "
+        "table.sort(patches,function(a,b) return a.nearest_distance<b.nearest_distance end) "
+        "while #patches>24 do table.remove(patches) end "
+        "return {requested_resource=\"" + resource + "\",radius=" + std::to_string(radius) +
+        ",player_position={x=p.position.x,y=p.position.y},coordinate_hint='positive x is east; positive y is south',"
+        "grouping='32-tile survey cells; adjacent results can belong to one physical patch',patches=patches} ");
+}
+
 json FactorioTools::Walk(const json& arguments, std::stop_token stopToken) const
 {
     const auto directionValue = arguments.find("direction");
@@ -301,6 +399,45 @@ json FactorioTools::Walk(const json& arguments, std::stop_token stopToken) const
     return StopWalking();
 }
 
+json FactorioTools::RequestPath(
+    double targetX,
+    double targetY,
+    double stoppingDistance,
+    std::stop_token stopToken) const
+{
+    const auto request = ExecuteJson(
+        "local iface=remote.interfaces['factoria_bridge'] "
+        "if not iface or not iface.request_path or not iface.take_path_result then "
+        "return {available=false} end "
+        "local p=game.connected_players[1] if not p then error('No connected player') end "
+        "local id=remote.call('factoria_bridge','request_path',p.index," +
+        std::to_string(targetX) + "," + std::to_string(targetY) + "," +
+        std::to_string(std::max(0.1, stoppingDistance - 0.4)) + ") return {available=true,id=id}");
+    if (!request.value("available", false))
+        return {{"available", false}};
+
+    const auto id = request.value("id", 0U);
+    if (id == 0U)
+        throw std::runtime_error("FactorIA Bridge returned an invalid path request id");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!stopToken.stop_requested() && std::chrono::steady_clock::now() < deadline)
+    {
+        auto poll = ExecuteJson(
+            "local result=remote.call('factoria_bridge','take_path_result'," + std::to_string(id) + ") "
+            "if result then return {pending=false,result=result} end return {pending=true}");
+        if (!poll.value("pending", true))
+        {
+            auto result = poll.value("result", json::object());
+            result["available"] = true;
+            return result;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (stopToken.stop_requested())
+        return {{"available", true}, {"stopped", true}};
+    return {{"available", true}, {"timed_out", true}};
+}
+
 json FactorioTools::WalkTo(const json& arguments, std::stop_token stopToken) const
 {
     const auto targetX = RequiredNumber(arguments, "x", -1000000.0, 1000000.0);
@@ -308,15 +445,50 @@ json FactorioTools::WalkTo(const json& arguments, std::stop_token stopToken) con
     const auto stoppingDistance = RequiredNumber(arguments, "stopping_distance", 0.5, 10.0);
     const auto maximumSeconds = RequiredNumber(arguments, "maximum_duration_seconds", 1.0, 30.0);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(maximumSeconds);
-    auto progressDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    auto bestDistance = std::numeric_limits<double>::infinity();
-    json lastState = json::object();
+    const auto pathResult = RequestPath(targetX, targetY, stoppingDistance, stopToken);
+    const auto pathfinderAvailable = pathResult.value("available", false);
+    if (pathfinderAvailable && !pathResult.value("found", false))
+    {
+        auto result = StopWalking();
+        result["reached"] = false;
+        result["unreachable"] = !pathResult.value("try_again_later", false) &&
+            !pathResult.value("timed_out", false) && !pathResult.value("stopped", false);
+        result["pathfinder_busy"] = pathResult.value("try_again_later", false);
+        result["pathfinder_timed_out"] = pathResult.value("timed_out", false);
+        result["stopped"] = pathResult.value("stopped", false);
+        result["navigation"] = "factorio_pathfinder";
+        return result;
+    }
 
-    const auto pulseBody =
+    std::vector<std::array<double, 2>> waypoints;
+    if (pathfinderAvailable)
+    {
+        for (const auto& waypoint : pathResult.value("path", json::array()))
+        {
+            const auto& position = waypoint.at("position");
+            waypoints.push_back({position.at("x").get<double>(), position.at("y").get<double>()});
+        }
+    }
+    if (waypoints.empty())
+        waypoints.push_back({targetX, targetY});
+
+    json lastState = json::object();
+    for (std::size_t index = 0; index < waypoints.size(); ++index)
+    {
+        const auto waypointX = waypoints[index][0];
+        const auto waypointY = waypoints[index][1];
+        const auto isFinal = index + 1U == waypoints.size();
+        const auto waypointStoppingDistance = isFinal
+            ? (pathfinderAvailable ? 0.35 : stoppingDistance)
+            : 0.65;
+        auto progressDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        auto bestDistance = std::numeric_limits<double>::infinity();
+
+        const auto pulseBody =
         "local p=game.connected_players[1] if not p then error('No connected player') end "
-        "local tx=" + std::to_string(targetX) + " local ty=" + std::to_string(targetY) + " "
+        "local tx=" + std::to_string(waypointX) + " local ty=" + std::to_string(waypointY) + " "
         "local dx=tx-p.position.x local dy=ty-p.position.y local distance=math.sqrt(dx*dx+dy*dy) "
-        "if distance<=" + std::to_string(stoppingDistance) + " then "
+        "if distance<=" + std::to_string(waypointStoppingDistance) + " then "
         "p.walking_state={walking=false,direction=defines.direction.north} "
         "return {reached=true,distance=distance,position={x=p.position.x,y=p.position.y}} end "
         "local ax=math.abs(dx) local ay=math.abs(dy) local direction "
@@ -329,34 +501,49 @@ json FactorioTools::WalkTo(const json& arguments, std::stop_token stopToken) con
         "p.walking_state={walking=true,direction=direction} "
         "return {reached=false,distance=distance,position={x=p.position.x,y=p.position.y}}";
 
-    while (!stopToken.stop_requested() && std::chrono::steady_clock::now() < deadline)
-    {
-        lastState = ExecuteJson(pulseBody);
-        if (lastState.value("reached", false))
-            return lastState;
+        while (!stopToken.stop_requested() && std::chrono::steady_clock::now() < deadline)
+        {
+            lastState = ExecuteJson(pulseBody);
+            if (lastState.value("reached", false))
+                break;
 
-        const auto distance = lastState.value("distance", bestDistance);
-        if (distance < bestDistance - 0.15)
-        {
-            bestDistance = distance;
-            progressDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            const auto distance = lastState.value("distance", bestDistance);
+            if (distance < bestDistance - 0.15)
+            {
+                bestDistance = distance;
+                progressDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            }
+            else if (std::chrono::steady_clock::now() >= progressDeadline)
+            {
+                auto result = StopWalking();
+                result["reached"] = false;
+                result["blocked"] = true;
+                result["distance_to_waypoint"] = distance;
+                result["navigation"] = pathfinderAvailable ? "factorio_pathfinder" : "direct_fallback";
+                result["pathfinder_available"] = pathfinderAvailable;
+                if (!pathfinderAvailable)
+                    result["hint"] = "Install and enable the bundled FactorIA Bridge mod so walk_to can route around water and other obstacles.";
+                return result;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        else if (std::chrono::steady_clock::now() >= progressDeadline)
-        {
-            auto result = StopWalking();
-            result["reached"] = false;
-            result["blocked"] = true;
-            result["distance"] = distance;
-            return result;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (!lastState.value("reached", false))
+            break;
     }
 
     auto result = StopWalking();
-    result["reached"] = false;
+    const auto finalState = ExecuteJson(
+        "local p=game.connected_players[1] if not p then error('No connected player') end "
+        "local dx=" + std::to_string(targetX) + "-p.position.x local dy=" +
+        std::to_string(targetY) + "-p.position.y return {distance=math.sqrt(dx*dx+dy*dy)}");
+    const auto finalDistance = finalState.value("distance", std::numeric_limits<double>::infinity());
+    result["reached"] = finalDistance <= stoppingDistance;
+    result["distance"] = finalDistance;
+    result["navigation"] = pathfinderAvailable ? "factorio_pathfinder" : "direct_fallback";
+    result["pathfinder_available"] = pathfinderAvailable;
+    result["waypoint_count"] = waypoints.size();
     result["stopped"] = stopToken.stop_requested();
-    result["timed_out"] = !stopToken.stop_requested();
-    if (lastState.contains("distance")) result["distance"] = lastState["distance"];
+    result["timed_out"] = !result.value("reached", false) && !stopToken.stop_requested();
     return result;
 }
 
@@ -366,6 +553,71 @@ json FactorioTools::StopWalking() const
         "local p=game.connected_players[1] if not p then error('No connected player') end "
         "p.walking_state={walking=false,direction=defines.direction.north} "
         "return {position={x=p.position.x,y=p.position.y}}");
+}
+
+json FactorioTools::TakeScreenshot(const json& arguments, std::stop_token stopToken) const
+{
+    const auto width = RequiredInteger(arguments, "width", 320, 1280);
+    const auto height = RequiredInteger(arguments, "height", 240, 960);
+    const auto zoom = RequiredNumber(arguments, "zoom", 0.25, 2.0);
+    if (factorioUserDataPath_.empty())
+        throw std::runtime_error("Factorio user data directory is not configured");
+
+    const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto fileName = "screenshot-" + std::to_string(stamp) + ".png";
+    const auto relativePath = std::filesystem::path("FactorIA") / fileName;
+    const auto absolutePath = factorioUserDataPath_ / "script-output" / relativePath;
+
+    ExecuteJson(
+        "local p=game.connected_players[1] if not p then error('No connected player') end "
+        "game.take_screenshot{player=p,resolution={x=" + std::to_string(width) +
+        ",y=" + std::to_string(height) + "},zoom=" + std::to_string(zoom) +
+        ",path=\"FactorIA/" + fileName + "\",show_gui=false,show_entity_info=true,force_render=true} "
+        "return {requested=true}");
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    std::uintmax_t previousSize = 0;
+    int stableChecks = 0;
+    while (!stopToken.stop_requested() && std::chrono::steady_clock::now() < deadline)
+    {
+        std::error_code error;
+        const auto size = std::filesystem::file_size(absolutePath, error);
+        if (!error && size > 0U)
+        {
+            if (size == previousSize)
+                ++stableChecks;
+            else
+                stableChecks = 0;
+            previousSize = size;
+            if (stableChecks >= 2)
+                break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (stopToken.stop_requested())
+        throw std::runtime_error("Screenshot capture was stopped");
+    if (!std::filesystem::exists(absolutePath))
+        throw std::runtime_error(
+            "Factorio did not create the screenshot. Check the user data directory and ensure Factorio is not headless: " +
+            absolutePath.string());
+    const auto size = std::filesystem::file_size(absolutePath);
+    if (size == 0U || size > 12U * 1024U * 1024U)
+        throw std::runtime_error("Factorio screenshot has an invalid or excessive file size");
+
+    std::ifstream input(absolutePath, std::ios::binary);
+    if (!input)
+        throw std::runtime_error("Unable to open Factorio screenshot: " + absolutePath.string());
+    const std::vector<unsigned char> bytes{
+        std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>{}};
+    return {
+        {"captured", true},
+        {"path", absolutePath.string()},
+        {"width", width},
+        {"height", height},
+        {"zoom", zoom},
+        {"_image_data_url", "data:image/png;base64," + Base64Encode(bytes)},
+    };
 }
 
 json FactorioTools::MineEntity(const json& arguments, std::stop_token stopToken) const

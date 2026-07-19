@@ -1,0 +1,9 @@
+{
+  "name": "factoria-bridge",
+  "version": "0.1.0",
+  "title": "FactorIA Bridge",
+  "author": "FactorIA",
+  "factorio_version": "2.0",
+  "dependencies": ["base >= 2.0.0"],
+  "description": "Provides asynchronous collision-aware path results to the FactorIA desktop bridge."
+}
