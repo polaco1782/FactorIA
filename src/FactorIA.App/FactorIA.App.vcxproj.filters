@@ -19,6 +19,7 @@
     <ClInclude Include="include\FactorIA\FactorioTools.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="include\FactorIA\LlamaClient.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="include\FactorIA\RconClient.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\FactorioRuntimeActions.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\MainFrame.h"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>
 </Project>

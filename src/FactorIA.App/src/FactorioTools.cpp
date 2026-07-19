@@ -1,11 +1,11 @@
 #include <FactorIA/FactorioTools.h>
 
+#include "FactorioRuntimeActions.h"
+
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cmath>
 #include <fstream>
-#include <limits>
 #include <regex>
 #include <stdexcept>
 #include <string_view>
@@ -78,6 +78,28 @@ std::string DirectionExpression(const std::string& direction)
     throw std::runtime_error("direction must be north, east, south, or west");
 }
 
+std::string MachineInventoryExpression(const std::string& inventory)
+{
+    if (inventory == "fuel") return "defines.inventory.fuel";
+    if (inventory == "input") return "defines.inventory.crafter_input";
+    if (inventory == "output") return "defines.inventory.crafter_output";
+    throw std::runtime_error("inventory must be fuel, input, or output");
+}
+
+std::string MachineLookupLua(double targetX, double targetY)
+{
+    return
+        "local p=game.connected_players[1] if not p then error('No connected player') end "
+        "local position={x=" + std::to_string(targetX) + ",y=" + std::to_string(targetY) + "} "
+        "local found=p.surface.find_entities_filtered{position=position,radius=0.75,"
+        "type={'furnace','assembling-machine'}} "
+        "table.sort(found,function(a,b) local adx=a.position.x-position.x local ady=a.position.y-position.y "
+        "local bdx=b.position.x-position.x local bdy=b.position.y-position.y "
+        "return adx*adx+ady*ady<bdx*bdx+bdy*bdy end) "
+        "local target=found[1] if not target then error('No furnace or crafting machine found at the requested position') end "
+        "if not p.can_reach_entity(target) then error('Target machine is out of reach') end ";
+}
+
 void RejectUnknownArguments(const json& arguments, std::initializer_list<std::string_view> allowed)
 {
     for (const auto& [name, value] : arguments.items())
@@ -123,6 +145,17 @@ std::string Base64Encode(const std::vector<unsigned char>& input)
     }
     return output;
 }
+
+std::string LuaStringLiteral(std::string_view value)
+{
+    return json(std::string(value)).dump();
+}
+
+std::chrono::steady_clock::time_point DeadlineAfter(double seconds)
+{
+    return std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(seconds));
+}
 }
 
 FactorioTools::FactorioTools(CommandExecutor executeCommand, std::filesystem::path factorioUserDataPath)
@@ -142,11 +175,20 @@ FactorioTools::FactorioTools(CommandExecutor executeCommand, std::filesystem::pa
             "List every item and count in the connected player's main inventory.",
             EmptyParameters()),
         FunctionTool(
+            "get_craftable_recipes",
+            "List enabled hand-crafting recipes that the player can craft now, including the currently craftable count.",
+            EmptyParameters()),
+        FunctionTool(
             "get_nearby_entities",
-            "Return the 40 nearest entities, sorted by distance, with player-relative deltas. Factorio X increases east and Y increases south, so a negative delta_y is north.",
+            "Return a page of up to 40 nearby entities with player-relative deltas. Distinct prototypes are returned before duplicate instances so dense groups cannot hide other nearby entity kinds. Optionally filter by an exact Factorio prototype name or entity type. If next_offset is returned, pass it as offset to inspect the next page. Factorio X increases east and Y increases south, so a negative delta_y is north.",
             {
                 {"type", "object"},
-                {"properties", {{"radius", {{"type", "number"}, {"minimum", 1.0}, {"maximum", 128.0}}}}},
+                {"properties", {
+                    {"radius", {{"type", "number"}, {"minimum", 1.0}, {"maximum", 128.0}}},
+                    {"name", {{"type", "string"}, {"minLength", 1}, {"maxLength", 128}}},
+                    {"type", {{"type", "string"}, {"minLength", 1}, {"maxLength", 128}}},
+                    {"offset", {{"type", "integer"}, {"minimum", 0}, {"maximum", 10000}}},
+                }},
                 {"required", {"radius"}},
                 {"additionalProperties", false},
             }),
@@ -207,15 +249,16 @@ FactorioTools::FactorioTools(CommandExecutor executeCommand, std::filesystem::pa
             }),
         FunctionTool(
             "mine_entity",
-            "Mine the entity at exact map coordinates using normal player mining over time. The player must first be within reach.",
+            "Continuously mine the entity at exact map coordinates using normal player mining. For resource nodes, count is the number of resource units to extract. Coordinates identify only one tree, rock, or other discrete entity, so their effective count is automatically one. The player must first be within reach.",
             {
                 {"type", "object"},
                 {"properties", {
                     {"x", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
                     {"y", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
-                    {"maximum_duration_seconds", {{"type", "number"}, {"minimum", 1.0}, {"maximum", 30.0}}},
+                    {"count", {{"type", "integer"}, {"minimum", 1}, {"maximum", 200}}},
+                    {"maximum_duration_seconds", {{"type", "number"}, {"minimum", 1.0}, {"maximum", 120.0}}},
                 }},
-                {"required", {"x", "y", "maximum_duration_seconds"}},
+                {"required", {"x", "y", "count", "maximum_duration_seconds"}},
                 {"additionalProperties", false},
             }),
         FunctionTool(
@@ -230,12 +273,79 @@ FactorioTools::FactorioTools(CommandExecutor executeCommand, std::filesystem::pa
                 {"required", {"recipe", "count"}},
                 {"additionalProperties", false},
             }),
+        FunctionTool(
+            "place_entity",
+            "Place one buildable item from the player's inventory on a reachable open tile using normal Factorio build rules. The item is consumed only when placement succeeds.",
+            {
+                {"type", "object"},
+                {"properties", {
+                    {"item", {{"type", "string"}, {"minLength", 1}, {"maxLength", 128}}},
+                    {"x", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
+                    {"y", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
+                    {"direction", {{"type", "string"}, {"enum", {"north", "east", "south", "west"}}}},
+                }},
+                {"required", {"item", "x", "y", "direction"}},
+                {"additionalProperties", false},
+            }),
+        FunctionTool(
+            "insert_item_into_entity",
+            "Move a specified item count from the player into a reachable furnace or crafting machine. Use inventory='fuel' for fuel and inventory='input' for ingredients such as ore.",
+            {
+                {"type", "object"},
+                {"properties", {
+                    {"x", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
+                    {"y", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
+                    {"item", {{"type", "string"}, {"minLength", 1}, {"maxLength", 128}}},
+                    {"count", {{"type", "integer"}, {"minimum", 1}, {"maximum", 10000}}},
+                    {"inventory", {{"type", "string"}, {"enum", {"fuel", "input"}}}},
+                }},
+                {"required", {"x", "y", "item", "count", "inventory"}},
+                {"additionalProperties", false},
+            }),
+        FunctionTool(
+            "take_item_from_entity",
+            "Move a specified item count from a reachable furnace or crafting machine into the player's inventory. Use inventory='output' to collect smelted plates.",
+            {
+                {"type", "object"},
+                {"properties", {
+                    {"x", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
+                    {"y", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
+                    {"item", {{"type", "string"}, {"minLength", 1}, {"maxLength", 128}}},
+                    {"count", {{"type", "integer"}, {"minimum", 1}, {"maximum", 10000}}},
+                    {"inventory", {{"type", "string"}, {"enum", {"fuel", "input", "output"}}}},
+                }},
+                {"required", {"x", "y", "item", "count", "inventory"}},
+                {"additionalProperties", false},
+            }),
+        FunctionTool(
+            "transfer_inventory_to_container",
+            "Move as much of the player's main inventory as possible into the reachable chest or logistic container at the given exact map coordinates. Reports any items left behind when the container is full.",
+            {
+                {"type", "object"},
+                {"properties", {
+                    {"x", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
+                    {"y", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
+                }},
+                {"required", {"x", "y"}},
+                {"additionalProperties", false},
+            }),
     });
 }
 
-const json& FactorioTools::Definitions() const noexcept
+json FactorioTools::Definitions(bool includeScreenshot) const
 {
-    return definitions_;
+    if (includeScreenshot)
+        return definitions_;
+
+    auto definitions = definitions_;
+    for (auto definition = definitions.begin(); definition != definitions.end();)
+    {
+        if (definition->value("function", json::object()).value("name", std::string{}) == "take_screenshot")
+            definition = definitions.erase(definition);
+        else
+            ++definition;
+    }
+    return definitions;
 }
 
 json FactorioTools::Execute(const std::string& name, const json& arguments, std::stop_token stopToken) const
@@ -252,9 +362,14 @@ json FactorioTools::Execute(const std::string& name, const json& arguments, std:
         RejectUnknownArguments(arguments, {});
         return GetInventory();
     }
+    if (name == "get_craftable_recipes")
+    {
+        RejectUnknownArguments(arguments, {});
+        return GetCraftableRecipes();
+    }
     if (name == "get_nearby_entities")
     {
-        RejectUnknownArguments(arguments, {"radius"});
+        RejectUnknownArguments(arguments, {"radius", "name", "type", "offset"});
         return GetNearbyEntities(arguments);
     }
     if (name == "find_resource_patches")
@@ -284,13 +399,33 @@ json FactorioTools::Execute(const std::string& name, const json& arguments, std:
     }
     if (name == "mine_entity")
     {
-        RejectUnknownArguments(arguments, {"x", "y", "maximum_duration_seconds"});
+        RejectUnknownArguments(arguments, {"x", "y", "count", "maximum_duration_seconds"});
         return MineEntity(arguments, stopToken);
     }
     if (name == "craft")
     {
         RejectUnknownArguments(arguments, {"recipe", "count"});
         return Craft(arguments);
+    }
+    if (name == "place_entity")
+    {
+        RejectUnknownArguments(arguments, {"item", "x", "y", "direction"});
+        return PlaceEntity(arguments);
+    }
+    if (name == "insert_item_into_entity")
+    {
+        RejectUnknownArguments(arguments, {"x", "y", "item", "count", "inventory"});
+        return InsertItemIntoEntity(arguments);
+    }
+    if (name == "take_item_from_entity")
+    {
+        RejectUnknownArguments(arguments, {"x", "y", "item", "count", "inventory"});
+        return TakeItemFromEntity(arguments);
+    }
+    if (name == "transfer_inventory_to_container")
+    {
+        RejectUnknownArguments(arguments, {"x", "y"});
+        return TransferInventoryToContainer(arguments);
     }
     throw std::runtime_error("Unknown FactorIA tool: " + name);
 }
@@ -305,14 +440,115 @@ json FactorioTools::ExecuteJson(const std::string& body) const
     return ParseFactorioJson(executeCommand_(command));
 }
 
+void FactorioTools::EnsurePlayerControlAction() const
+{
+    const auto actionName = std::string(runtime::PlayerControlActionName);
+    const auto info = ExecuteJson(
+        "local iface=remote.interfaces['factoria_bridge'] "
+        "if not iface or not iface.runtime_info or not iface.begin_action_upload or "
+        "not iface.append_action_upload or not iface.finish_action_upload or not iface.start_action or "
+        "not iface.poll_action or not iface.stop_action then return {available=false} end "
+        "local result=remote.call('factoria_bridge','runtime_info'," + LuaStringLiteral(actionName) + ") "
+        "result.available=true return result");
+    if (!info.value("available", false))
+        throw std::runtime_error(
+            "The updated FactorIA Bridge mod is required for smooth walking and mining");
+    if (info.value("version", 0) != 1)
+        throw std::runtime_error("The FactorIA Bridge runtime protocol version is not supported");
+    if (playerControlActionReady_ && info.value("action_installed", false))
+        return;
+
+    ExecuteJson(
+        "return remote.call('factoria_bridge','begin_action_upload'," + LuaStringLiteral(actionName) + ")");
+    constexpr std::size_t UploadPartSize = 1536;
+    for (std::size_t offset = 0; offset < runtime::PlayerControlSource.size(); offset += UploadPartSize)
+    {
+        const auto sourcePart = runtime::PlayerControlSource.substr(offset, UploadPartSize);
+        ExecuteJson(
+            "return remote.call('factoria_bridge','append_action_upload'," + LuaStringLiteral(actionName) + "," +
+            LuaStringLiteral(sourcePart) + ")");
+    }
+    const auto installed = ExecuteJson(
+        "return remote.call('factoria_bridge','finish_action_upload'," + LuaStringLiteral(actionName) + ")");
+    if (!installed.value("installed", false))
+        throw std::runtime_error("Factorio did not install the FactorIA player-control action");
+    playerControlActionReady_ = true;
+}
+
+json FactorioTools::StartPlayerControlAction(const json& arguments) const
+{
+    EnsurePlayerControlAction();
+    return ExecuteJson(
+        "local arguments=helpers.json_to_table(" + LuaStringLiteral(arguments.dump()) + ") "
+        "return remote.call('factoria_bridge','start_action'," +
+        LuaStringLiteral(runtime::PlayerControlActionName) + ",arguments)");
+}
+
+json FactorioTools::PollPlayerControlAction(std::uint64_t jobId) const
+{
+    return ExecuteJson(
+        "return remote.call('factoria_bridge','poll_action'," + std::to_string(jobId) + ")");
+}
+
+json FactorioTools::StopPlayerControlAction(std::uint64_t jobId) const
+{
+    return ExecuteJson(
+        "return remote.call('factoria_bridge','stop_action'," + std::to_string(jobId) + ")");
+}
+
+json FactorioTools::WaitForPlayerControlAction(
+    const json& startResult,
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stopToken) const
+{
+    const auto jobId = startResult.value("job_id", std::uint64_t{0});
+    if (jobId == 0)
+        throw std::runtime_error("FactorIA Bridge returned an invalid runtime job id");
+
+    auto extractResult = [](const json& envelope) {
+        auto result = envelope.value("result", json::object());
+        if (result.value("failed", false))
+            throw std::runtime_error("FactorIA runtime action failed: " + result.value("error", "unknown error"));
+        return result;
+    };
+
+    if (!startResult.value("active", false))
+        return extractResult(startResult);
+
+    while (!stopToken.stop_requested() && std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const auto status = PollPlayerControlAction(jobId);
+        if (!status.value("active", false))
+        {
+            if (status.value("missing", false))
+                throw std::runtime_error("FactorIA runtime job disappeared before completion");
+            return extractResult(status);
+        }
+    }
+
+    auto result = extractResult(StopPlayerControlAction(jobId));
+    result["stopped"] = stopToken.stop_requested();
+    result["timed_out"] = !stopToken.stop_requested();
+    return result;
+}
+
 json FactorioTools::GetGameState() const
 {
     return ExecuteJson(
         "local p=game.connected_players[1] if not p then error('No connected player') end "
+        "local bridge=remote.interfaces['factoria_bridge'] "
         "return {tick=game.tick,player={name=p.name,position={x=p.position.x,y=p.position.y},"
-        "walking=p.walking_state.walking,direction=p.walking_state.direction},"
+        "health=p.character and p.character.health or nil,"
+        "max_health=p.character and p.character.max_health or nil,"
+        "walking=p.walking_state.walking,direction=p.walking_state.direction,"
+        "mining=p.mining_state.mining,selected=p.selected and p.selected.name or nil,"
+        "cursor_item=p.cursor_stack and p.cursor_stack.valid_for_read and p.cursor_stack.name or nil},"
         "crafting_queue_size=p.crafting_queue_size,"
-        "bridge_mod_available=remote.interfaces['factoria_bridge']~=nil}");
+        "environment={surface=p.surface.name,daytime=p.surface.daytime,darkness=p.surface.darkness,"
+        "pollution=p.surface.get_pollution(p.position)},"
+        "bridge_mod_available=bridge~=nil,"
+        "bridge_runtime_available=bridge~=nil and bridge.runtime_info~=nil and bridge.start_action~=nil}");
 }
 
 json FactorioTools::GetInventory() const
@@ -325,21 +561,69 @@ json FactorioTools::GetInventory() const
         "table.sort(items,function(a,b) return a.name<b.name end) return {items=items}");
 }
 
+json FactorioTools::GetCraftableRecipes() const
+{
+    return ExecuteJson(
+        "local p=game.connected_players[1] if not p then error('No connected player') end "
+        "local recipes={} for name,recipe in pairs(p.force.recipes) do "
+        "if recipe.enabled and name~='recipe-unknown' then local count=p.get_craftable_count(recipe) if count>0 then "
+        "recipes[#recipes+1]={name=name,craftable_count=count} end end end "
+        "table.sort(recipes,function(a,b) return a.name<b.name end) "
+        "local total=#recipes while #recipes>100 do table.remove(recipes) end "
+        "return {recipes=recipes,total_count=total,truncated=total>#recipes}");
+}
+
 json FactorioTools::GetNearbyEntities(const json& arguments) const
 {
     const auto radius = RequiredNumber(arguments, "radius", 1.0, 128.0);
+    const auto nameFilter = arguments.contains("name")
+        ? " filter.name=\"" + RequiredPrototypeName(arguments, "name") + "\" "
+        : std::string{};
+    const auto typeFilter = arguments.contains("type")
+        ? " filter.type=\"" + RequiredPrototypeName(arguments, "type") + "\" "
+        : std::string{};
+    const auto offset = arguments.contains("offset")
+        ? RequiredInteger(arguments, "offset", 0, 10000)
+        : 0;
     return ExecuteJson(
         "local p=game.connected_players[1] if not p then error('No connected player') end "
-        "local found=p.surface.find_entities_filtered{position=p.position,radius=" + std::to_string(radius) + "} "
+        "local function summarize(inv,limit) if not inv then return nil end local items={} "
+        "for _,item in pairs(inv.get_contents()) do items[#items+1]={name=item.name,count=item.count} end "
+        "table.sort(items,function(a,b) return a.count>b.count end) "
+        "while #items>limit do table.remove(items) end if #items==0 then return nil end return items end "
+        "local filter={position=p.position,radius=" + std::to_string(radius) + "} " +
+        nameFilter + typeFilter +
+        "local found=p.surface.find_entities_filtered(filter) "
         "table.sort(found,function(a,b) local adx=a.position.x-p.position.x local ady=a.position.y-p.position.y "
         "local bdx=b.position.x-p.position.x local bdy=b.position.y-p.position.y "
         "return adx*adx+ady*ady<bdx*bdx+bdy*bdy end) "
-        "local entities={} for _,e in pairs(found) do if #entities>=40 then break end "
+        "local counts={} local total=0 local distinct=0 for _,e in ipairs(found) do if e~=p.character then "
+        "if not counts[e.name] then counts[e.name]=0 distinct=distinct+1 end "
+        "counts[e.name]=counts[e.name]+1 total=total+1 end end "
+        "local ordered={} local duplicates={} local seen={} for _,e in ipairs(found) do if e~=p.character then "
+        "if not seen[e.name] then seen[e.name]=true ordered[#ordered+1]=e else duplicates[#duplicates+1]=e end end end "
+        "for _,e in ipairs(duplicates) do ordered[#ordered+1]=e end "
+        "local offset=" + std::to_string(offset) + " local entities={} "
+        "for index=offset+1,#ordered do if #entities>=40 then break end local e=ordered[index] "
         "local dx=e.position.x-p.position.x local dy=e.position.y-p.position.y "
-        "entities[#entities+1]={name=e.name,type=e.type,position={x=e.position.x,y=e.position.y},"
-        "delta={x=dx,y=dy},distance=math.sqrt(dx*dx+dy*dy),direction=e.direction,health=e.health} end "
+        "local info={name=e.name,type=e.type,force=e.force and e.force.name or nil,"
+        "position={x=e.position.x,y=e.position.y},delta={x=dx,y=dy},"
+        "distance=math.sqrt(dx*dx+dy*dy),direction=e.direction,health=e.health,"
+        "minable=e.minable,reachable=p.can_reach_entity(e),prototype_count_in_radius=counts[e.name]} "
+        "if e.type=='resource' then info.amount=e.amount "
+        "elseif e.type=='container' or e.type=='logistic-container' then "
+        "info.inventory={items=summarize(e.get_inventory(defines.inventory.chest),6)} "
+        "elseif e.type=='furnace' then info.crafting=e.is_crafting() info.inventory={"
+        "fuel=summarize(e.get_inventory(defines.inventory.fuel),4),"
+        "input=summarize(e.get_inventory(defines.inventory.crafter_input),4),"
+        "output=summarize(e.get_inventory(defines.inventory.crafter_output),4)} "
+        "elseif e.type=='assembling-machine' then info.crafting=e.is_crafting() end "
+        "entities[#entities+1]=info end "
         "return {radius=" + std::to_string(radius) + ",player_position={x=p.position.x,y=p.position.y},"
-        "coordinate_hint='positive x is east; positive y is south',entities=entities}");
+        "coordinate_hint='positive x is east; positive y is south',"
+        "ordering='nearest representative of each distinct prototype first, then nearest duplicate instances',"
+        "offset=offset,total_entities=total,distinct_prototypes=distinct,truncated=offset+#entities<total,"
+        "next_offset=offset+#entities<total and offset+#entities or nil,entities=entities}");
 }
 
 json FactorioTools::FindResourcePatches(const json& arguments) const
@@ -384,19 +668,20 @@ json FactorioTools::Walk(const json& arguments, std::stop_token stopToken) const
     const auto directionValue = arguments.find("direction");
     if (directionValue == arguments.end() || !directionValue->is_string())
         throw std::runtime_error("Missing string argument: direction");
-    const auto direction = DirectionExpression(directionValue->get<std::string>());
+    const auto direction = directionValue->get<std::string>();
+    static_cast<void>(DirectionExpression(direction));
     const auto seconds = RequiredNumber(arguments, "duration_seconds", 0.1, 10.0);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
-    const std::string pulse =
-        "/sc local p=game.connected_players[1] if p then p.walking_state={walking=true,direction=" +
-        direction + "} end";
-
-    while (!stopToken.stop_requested() && std::chrono::steady_clock::now() < deadline)
-    {
-        executeCommand_(pulse);
-        std::this_thread::sleep_for(std::chrono::milliseconds(14));
-    }
-    return StopWalking();
+    const auto start = StartPlayerControlAction({
+        {"kind", "walk_direction"},
+        {"direction", direction},
+        {"duration_seconds", seconds},
+    });
+    auto result = WaitForPlayerControlAction(
+        start,
+        DeadlineAfter(seconds + 2.0),
+        stopToken);
+    result["walking_control"] = "factorio_bridge_runtime";
+    return result;
 }
 
 json FactorioTools::RequestPath(
@@ -444,9 +729,11 @@ json FactorioTools::WalkTo(const json& arguments, std::stop_token stopToken) con
     const auto targetY = RequiredNumber(arguments, "y", -1000000.0, 1000000.0);
     const auto stoppingDistance = RequiredNumber(arguments, "stopping_distance", 0.5, 10.0);
     const auto maximumSeconds = RequiredNumber(arguments, "maximum_duration_seconds", 1.0, 30.0);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(maximumSeconds);
+    EnsurePlayerControlAction();
     const auto pathResult = RequestPath(targetX, targetY, stoppingDistance, stopToken);
     const auto pathfinderAvailable = pathResult.value("available", false);
+    if (!pathfinderAvailable)
+        throw std::runtime_error("The FactorIA Bridge pathfinder is unavailable");
     if (pathfinderAvailable && !pathResult.value("found", false))
     {
         auto result = StopWalking();
@@ -460,90 +747,29 @@ json FactorioTools::WalkTo(const json& arguments, std::stop_token stopToken) con
         return result;
     }
 
-    std::vector<std::array<double, 2>> waypoints;
-    if (pathfinderAvailable)
+    json waypoints = json::array();
+    for (const auto& waypoint : pathResult.value("path", json::array()))
     {
-        for (const auto& waypoint : pathResult.value("path", json::array()))
-        {
-            const auto& position = waypoint.at("position");
-            waypoints.push_back({position.at("x").get<double>(), position.at("y").get<double>()});
-        }
+        const auto& position = waypoint.at("position");
+        waypoints.push_back({{"x", position.at("x")}, {"y", position.at("y")}});
     }
     if (waypoints.empty())
-        waypoints.push_back({targetX, targetY});
+        waypoints.push_back({{"x", targetX}, {"y", targetY}});
 
-    json lastState = json::object();
-    for (std::size_t index = 0; index < waypoints.size(); ++index)
-    {
-        const auto waypointX = waypoints[index][0];
-        const auto waypointY = waypoints[index][1];
-        const auto isFinal = index + 1U == waypoints.size();
-        const auto waypointStoppingDistance = isFinal
-            ? (pathfinderAvailable ? 0.35 : stoppingDistance)
-            : 0.65;
-        auto progressDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        auto bestDistance = std::numeric_limits<double>::infinity();
-
-        const auto pulseBody =
-        "local p=game.connected_players[1] if not p then error('No connected player') end "
-        "local tx=" + std::to_string(waypointX) + " local ty=" + std::to_string(waypointY) + " "
-        "local dx=tx-p.position.x local dy=ty-p.position.y local distance=math.sqrt(dx*dx+dy*dy) "
-        "if distance<=" + std::to_string(waypointStoppingDistance) + " then "
-        "p.walking_state={walking=false,direction=defines.direction.north} "
-        "return {reached=true,distance=distance,position={x=p.position.x,y=p.position.y}} end "
-        "local ax=math.abs(dx) local ay=math.abs(dy) local direction "
-        "if ax<ay*0.4 then direction=dy<0 and defines.direction.north or defines.direction.south "
-        "elseif ay<ax*0.4 then direction=dx<0 and defines.direction.west or defines.direction.east "
-        "elseif dx>=0 and dy<0 then direction=defines.direction.northeast "
-        "elseif dx>=0 and dy>=0 then direction=defines.direction.southeast "
-        "elseif dx<0 and dy>=0 then direction=defines.direction.southwest "
-        "else direction=defines.direction.northwest end "
-        "p.walking_state={walking=true,direction=direction} "
-        "return {reached=false,distance=distance,position={x=p.position.x,y=p.position.y}}";
-
-        while (!stopToken.stop_requested() && std::chrono::steady_clock::now() < deadline)
-        {
-            lastState = ExecuteJson(pulseBody);
-            if (lastState.value("reached", false))
-                break;
-
-            const auto distance = lastState.value("distance", bestDistance);
-            if (distance < bestDistance - 0.15)
-            {
-                bestDistance = distance;
-                progressDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-            }
-            else if (std::chrono::steady_clock::now() >= progressDeadline)
-            {
-                auto result = StopWalking();
-                result["reached"] = false;
-                result["blocked"] = true;
-                result["distance_to_waypoint"] = distance;
-                result["navigation"] = pathfinderAvailable ? "factorio_pathfinder" : "direct_fallback";
-                result["pathfinder_available"] = pathfinderAvailable;
-                if (!pathfinderAvailable)
-                    result["hint"] = "Install and enable the bundled FactorIA Bridge mod so walk_to can route around water and other obstacles.";
-                return result;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        if (!lastState.value("reached", false))
-            break;
-    }
-
-    auto result = StopWalking();
-    const auto finalState = ExecuteJson(
-        "local p=game.connected_players[1] if not p then error('No connected player') end "
-        "local dx=" + std::to_string(targetX) + "-p.position.x local dy=" +
-        std::to_string(targetY) + "-p.position.y return {distance=math.sqrt(dx*dx+dy*dy)}");
-    const auto finalDistance = finalState.value("distance", std::numeric_limits<double>::infinity());
-    result["reached"] = finalDistance <= stoppingDistance;
-    result["distance"] = finalDistance;
-    result["navigation"] = pathfinderAvailable ? "factorio_pathfinder" : "direct_fallback";
-    result["pathfinder_available"] = pathfinderAvailable;
-    result["waypoint_count"] = waypoints.size();
-    result["stopped"] = stopToken.stop_requested();
-    result["timed_out"] = !result.value("reached", false) && !stopToken.stop_requested();
+    const auto start = StartPlayerControlAction({
+        {"kind", "walk_path"},
+        {"waypoints", std::move(waypoints)},
+        {"target", {{"x", targetX}, {"y", targetY}}},
+        {"stopping_distance", stoppingDistance},
+        {"maximum_duration_seconds", maximumSeconds},
+    });
+    auto result = WaitForPlayerControlAction(
+        start,
+        DeadlineAfter(maximumSeconds + 2.0),
+        stopToken);
+    result["navigation"] = "factorio_pathfinder";
+    result["pathfinder_available"] = true;
+    result["walking_control"] = "factorio_bridge_runtime";
     return result;
 }
 
@@ -624,53 +850,22 @@ json FactorioTools::MineEntity(const json& arguments, std::stop_token stopToken)
 {
     const auto targetX = RequiredNumber(arguments, "x", -1000000.0, 1000000.0);
     const auto targetY = RequiredNumber(arguments, "y", -1000000.0, 1000000.0);
-    const auto maximumSeconds = RequiredNumber(arguments, "maximum_duration_seconds", 1.0, 30.0);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(maximumSeconds);
-    json lastState = json::object();
-    bool sawEntity = false;
-    bool finished = false;
-
-    const auto pulseBody =
-        "local p=game.connected_players[1] if not p then error('No connected player') end "
-        "local target={x=" + std::to_string(targetX) + ",y=" + std::to_string(targetY) + "} "
-        "p.update_selected_entity(target) local e=p.selected "
-        "if not e then p.mining_state={mining=false} return {entity_present=false} end "
-        "if not p.can_reach_entity(e) then return {mined=false,out_of_reach=true,"
-        "entity_present=true,entity={name=e.name,position={x=e.position.x,y=e.position.y}}} end "
-        "p.mining_state={mining=true,position=target} "
-        "return {mined=false,out_of_reach=false,entity_present=true,progress=p.character_mining_progress,"
-        "entity={name=e.name,position={x=e.position.x,y=e.position.y}}}";
-
-    while (!stopToken.stop_requested() && std::chrono::steady_clock::now() < deadline)
-    {
-        lastState = ExecuteJson(pulseBody);
-        if (!lastState.value("entity_present", false))
-        {
-            lastState["mined"] = sawEntity;
-            lastState["missing"] = !sawEntity;
-            finished = true;
-            break;
-        }
-        sawEntity = true;
-        if (lastState.value("out_of_reach", false))
-        {
-            finished = true;
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-
-    ExecuteJson(
-        "local p=game.connected_players[1] if not p then error('No connected player') end "
-        "p.mining_state={mining=false} return true");
-    if (lastState.value("mined", false))
-        lastState["inventory"] = GetInventory();
-    else if (!finished)
-    {
-        lastState["stopped"] = stopToken.stop_requested();
-        lastState["timed_out"] = !stopToken.stop_requested();
-    }
-    return lastState;
+    const auto count = RequiredInteger(arguments, "count", 1, 200);
+    const auto maximumSeconds = RequiredNumber(arguments, "maximum_duration_seconds", 1.0, 120.0);
+    const auto start = StartPlayerControlAction({
+        {"kind", "mine"},
+        {"target", {{"x", targetX}, {"y", targetY}}},
+        {"count", count},
+        {"maximum_duration_seconds", maximumSeconds},
+    });
+    auto result = WaitForPlayerControlAction(
+        start,
+        DeadlineAfter(maximumSeconds + 2.0),
+        stopToken);
+    if (result.value("mined", false))
+        result["inventory"] = GetInventory();
+    result["mining_control"] = "factorio_bridge_runtime";
+    return result;
 }
 
 json FactorioTools::Craft(const json& arguments) const
@@ -681,5 +876,141 @@ json FactorioTools::Craft(const json& arguments) const
         "local p=game.connected_players[1] if not p then error('No connected player') end "
         "local crafted=p.begin_crafting{count=" + std::to_string(count) + ",recipe=\"" + recipe + "\"} "
         "return {queued=crafted,crafting_queue_size=p.crafting_queue_size}");
+}
+
+json FactorioTools::PlaceEntity(const json& arguments) const
+{
+    const auto item = RequiredPrototypeName(arguments, "item");
+    const auto targetX = RequiredNumber(arguments, "x", -1000000.0, 1000000.0);
+    const auto targetY = RequiredNumber(arguments, "y", -1000000.0, 1000000.0);
+    const auto directionValue = arguments.find("direction");
+    if (directionValue == arguments.end() || !directionValue->is_string())
+        throw std::runtime_error("Missing string argument: direction");
+    const auto direction = DirectionExpression(directionValue->get<std::string>());
+
+    return ExecuteJson(
+        "local p=game.connected_players[1] if not p then error('No connected player') end "
+        "local inv=p.get_main_inventory() if not inv then error('Player has no main inventory') end "
+        "if not p.clear_cursor() then error('Player cursor cannot be cleared safely') end "
+        "local source=inv.find_item_stack(\"" + item + "\") "
+        "if not source then error('Player does not have item: " + item + "') end "
+        "if not p.cursor_stack.swap_stack(source) then error('Unable to move item into player cursor') end "
+        "local place_result=p.cursor_stack.prototype.place_result "
+        "if not place_result then p.clear_cursor() error('Item cannot be placed as an entity: " + item + "') end "
+        "local requested={x=" + std::to_string(targetX) + ",y=" + std::to_string(targetY) + "} "
+        "local build={position=requested,direction=" + direction + "} "
+        "local accepted=p.can_build_from_cursor(build) if accepted then p.build_from_cursor(build) end "
+        "local entity=nil if accepted then "
+        "local found=p.surface.find_entities_filtered{position=requested,radius=1.5,name=place_result.name,force=p.force} "
+        "table.sort(found,function(a,b) local adx=a.position.x-requested.x local ady=a.position.y-requested.y "
+        "local bdx=b.position.x-requested.x local bdy=b.position.y-requested.y "
+        "return adx*adx+ady*ady<bdx*bdx+bdy*bdy end) entity=found[1] end "
+        "if not p.clear_cursor() then error('Unable to return remaining cursor items to inventory') end "
+        "local placed=entity~=nil local result={placed=placed,build_accepted=accepted,item=\"" + item + "\",requested_position=requested,"
+        "remaining_item_count=inv.get_item_count(\"" + item + "\")} "
+        "if entity then result.entity={name=entity.name,position={x=entity.position.x,y=entity.position.y},"
+        "direction=entity.direction,unit_number=entity.unit_number} end "
+        "if not accepted then result.reason='Factorio build rules rejected this position; choose another open tile within reach' "
+        "elseif not placed then result.reason='Factorio accepted the build but the placed entity could not be verified' end "
+        "return result");
+}
+
+json FactorioTools::InsertItemIntoEntity(const json& arguments) const
+{
+    const auto targetX = RequiredNumber(arguments, "x", -1000000.0, 1000000.0);
+    const auto targetY = RequiredNumber(arguments, "y", -1000000.0, 1000000.0);
+    const auto item = RequiredPrototypeName(arguments, "item");
+    const auto count = RequiredInteger(arguments, "count", 1, 10000);
+    const auto inventoryValue = arguments.find("inventory");
+    if (inventoryValue == arguments.end() || !inventoryValue->is_string())
+        throw std::runtime_error("Missing string argument: inventory");
+    const auto inventory = inventoryValue->get<std::string>();
+    if (inventory == "output")
+        throw std::runtime_error("Cannot insert items into a machine output inventory");
+    const auto inventoryExpression = MachineInventoryExpression(inventory);
+
+    return ExecuteJson(
+        MachineLookupLua(targetX, targetY) +
+        "local source=p.get_main_inventory() if not source then error('Player has no main inventory') end "
+        "local item_name=\"" + item + "\" if not prototypes.item[item_name] then error('Unknown item prototype: ' .. item_name) end "
+        "local destination=target.get_inventory(" + inventoryExpression + ") "
+        "if not destination then error('Target machine has no " + inventory + " inventory') end "
+        "local available=source.get_item_count(item_name) if available==0 then error('Player does not have item: ' .. item_name) end "
+        "local requested=math.min(" + std::to_string(count) + ",available,destination.get_insertable_count(item_name)) "
+        "local removed=0 local inserted=0 if requested>0 then "
+        "removed=source.remove{name=item_name,count=requested} "
+        "inserted=destination.insert{name=item_name,count=removed} "
+        "if inserted<removed then source.insert{name=item_name,count=removed-inserted} end end "
+        "return {entity={name=target.name,position={x=target.position.x,y=target.position.y}},"
+        "inventory=\"" + inventory + "\",item=item_name,requested_count=" + std::to_string(count) + ","
+        "inserted_count=inserted,player_remaining=source.get_item_count(item_name),"
+        "machine_item_count=destination.get_item_count(item_name),complete=inserted==" + std::to_string(count) + "}");
+}
+
+json FactorioTools::TakeItemFromEntity(const json& arguments) const
+{
+    const auto targetX = RequiredNumber(arguments, "x", -1000000.0, 1000000.0);
+    const auto targetY = RequiredNumber(arguments, "y", -1000000.0, 1000000.0);
+    const auto item = RequiredPrototypeName(arguments, "item");
+    const auto count = RequiredInteger(arguments, "count", 1, 10000);
+    const auto inventoryValue = arguments.find("inventory");
+    if (inventoryValue == arguments.end() || !inventoryValue->is_string())
+        throw std::runtime_error("Missing string argument: inventory");
+    const auto inventory = inventoryValue->get<std::string>();
+    const auto inventoryExpression = MachineInventoryExpression(inventory);
+
+    return ExecuteJson(
+        MachineLookupLua(targetX, targetY) +
+        "local destination=p.get_main_inventory() if not destination then error('Player has no main inventory') end "
+        "local item_name=\"" + item + "\" if not prototypes.item[item_name] then error('Unknown item prototype: ' .. item_name) end "
+        "local source=target.get_inventory(" + inventoryExpression + ") "
+        "if not source then error('Target machine has no " + inventory + " inventory') end "
+        "local available=source.get_item_count(item_name) "
+        "local requested=math.min(" + std::to_string(count) + ",available,destination.get_insertable_count(item_name)) "
+        "local removed=0 local inserted=0 if requested>0 then "
+        "removed=source.remove{name=item_name,count=requested} "
+        "inserted=destination.insert{name=item_name,count=removed} "
+        "if inserted<removed then source.insert{name=item_name,count=removed-inserted} end end "
+        "return {entity={name=target.name,position={x=target.position.x,y=target.position.y}},"
+        "inventory=\"" + inventory + "\",item=item_name,requested_count=" + std::to_string(count) + ","
+        "taken_count=inserted,available_before=available,machine_remaining=source.get_item_count(item_name),"
+        "complete=inserted==" + std::to_string(count) + "}");
+}
+
+json FactorioTools::TransferInventoryToContainer(const json& arguments) const
+{
+    const auto targetX = RequiredNumber(arguments, "x", -1000000.0, 1000000.0);
+    const auto targetY = RequiredNumber(arguments, "y", -1000000.0, 1000000.0);
+
+    return ExecuteJson(
+        "local p=game.connected_players[1] if not p then error('No connected player') end "
+        "local source=p.get_main_inventory() if not source then error('Player has no main inventory') end "
+        "local position={x=" + std::to_string(targetX) + ",y=" + std::to_string(targetY) + "} "
+        "local found=p.surface.find_entities_filtered{position=position,radius=1,type={'container','logistic-container'}} "
+        "table.sort(found,function(a,b) local adx=a.position.x-position.x local ady=a.position.y-position.y "
+        "local bdx=b.position.x-position.x local bdy=b.position.y-position.y "
+        "return adx*adx+ady*ady<bdx*bdx+bdy*bdy end) "
+        "local target=found[1] if not target then error('No container found at the requested position') end "
+        "if not p.can_reach_entity(target) then error('Container is out of reach') end "
+        "local destination=target.get_inventory(defines.inventory.chest) "
+        "if not destination then error('Target entity has no chest inventory') end "
+        "local destination_limit=#destination if destination.supports_bar() then "
+        "destination_limit=math.min(destination_limit,destination.get_bar()-1) end "
+        "local moved_by_item={} local total=0 for source_index=1,#source do "
+        "local stack=source[source_index] if stack.valid_for_read then "
+        "local item_name=stack.name local quality=tostring(stack.quality) local before=stack.count "
+        "for destination_index=1,destination_limit do "
+        "destination[destination_index].transfer_stack(stack) if not stack.valid_for_read then break end end "
+        "local after=stack.valid_for_read and stack.count or 0 local transferred=before-after "
+        "if transferred>0 then local key=item_name..':'..quality local moved=moved_by_item[key] "
+        "if not moved then moved={name=item_name,count=0,quality=quality} moved_by_item[key]=moved end "
+        "moved.count=moved.count+transferred total=total+transferred end end end "
+        "local moved={} for _,item in pairs(moved_by_item) do moved[#moved+1]=item end "
+        "table.sort(moved,function(a,b) return a.name<b.name end) "
+        "local remaining={} for _,item in pairs(source.get_contents()) do "
+        "remaining[#remaining+1]={name=item.name,count=item.count,quality=tostring(item.quality)} end "
+        "table.sort(remaining,function(a,b) return a.name<b.name end) "
+        "return {container={name=target.name,position={x=target.position.x,y=target.position.y},"
+        "unit_number=target.unit_number},moved=moved,moved_total=total,complete=source.is_empty(),remaining=remaining}");
 }
 }

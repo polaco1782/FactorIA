@@ -1,10 +1,12 @@
 .vs/
+bin/
 build/
 out/
 x64/
 [Dd]ebug/
 [Rr]elease/
 packages/
+vcpkg/
 vcpkg_installed/
 *.user
 *.VC.db

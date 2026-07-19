@@ -38,6 +38,7 @@ private:
     void DisconnectRcon();
     void TestRcon();
     void TestLlama();
+    void FetchOpenRouterModels();
     void RunAgent();
     void StopAgent();
     void StartWork(
@@ -60,7 +61,8 @@ private:
     wxTextCtrl* llamaModel_{};
     wxChoice* aiProvider_{};
     wxTextCtrl* openRouterApiKey_{};
-    wxTextCtrl* openRouterModel_{};
+    wxChoice* openRouterModel_{};
+    wxButton* fetchOpenRouterModelsButton_{};
     wxTextCtrl* factorioUserDataPath_{};
     wxStaticText* llamaStatus_{};
     wxButton* llamaTestButton_{};

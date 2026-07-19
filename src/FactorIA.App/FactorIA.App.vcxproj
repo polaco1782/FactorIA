@@ -66,6 +66,7 @@
     <ClInclude Include="include\FactorIA\FactorioTools.h" />
     <ClInclude Include="include\FactorIA\LlamaClient.h" />
     <ClInclude Include="include\FactorIA\RconClient.h" />
+    <ClInclude Include="src\FactorioRuntimeActions.h" />
     <ClInclude Include="src\MainFrame.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

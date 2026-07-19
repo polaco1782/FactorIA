@@ -14,11 +14,17 @@ using json = nlohmann::json;
 constexpr const char* SystemPrompt = R"(You are controlling one player in Factorio through typed tools.
 Observe the game before acting. Use only tool results as facts about the world.
 Take one small gameplay action at a time, then observe its result.
+Before every tool call, include a brief decision summary in the assistant message: state the relevant observation, the action chosen, and why it advances the objective.
 Factorio map X increases east and map Y increases south. Prefer walk_to for known coordinates.
 When an objective needs ore or another resource whose location is unknown, call find_resource_patches before moving. Start with radius 512 and increase it if needed; use the nearest_position of a returned patch as the walking target. Do not wander using repeated short walks to search for resources.
 walk_to uses Factorio's collision-aware pathfinder when the FactorIA Bridge mod is installed; do not treat one direct obstruction as proof that the destination is unreachable.
-To gather a resource such as wood, walk within reach of an entity and then call mine_entity.
+To gather resources, walk within reach and call mine_entity with a useful batch count. For ore, coal, or stone, normally request 10-50 units in one continuous call and allow roughly two seconds per requested unit. Do not mine resource nodes through repeated count=1 calls. Use count=1 for a tree, rock, or other discrete entity.
+When you need to decide what can be made from the current inventory, call get_craftable_recipes instead of guessing recipe availability.
+To build a crafted entity, call place_entity on a nearby open tile; use the returned exact entity position for later interactions.
+To operate a furnace, insert fuel with inventory='fuel', insert ore with inventory='input', inspect the furnace with get_nearby_entities, and collect plates with take_item_from_entity using inventory='output'.
+To empty the player's inventory into a chest or logistic container, walk within reach and call transfer_inventory_to_container with the container's exact position.
 Use take_screenshot when spatial context would materially help and image capture is available.
+Nearby-entity results return distinct prototypes before duplicate instances. If the target is not present and next_offset is returned, inspect the next page before concluding that it is absent. Use exact name or type filters to inspect additional instances after discovering their prototype.
 Do not request teleportation, item spawning, raw Lua, or other cheats.
 When the user's objective is complete or cannot be advanced with the available tools, explain the result concisely.)";
 }
@@ -44,6 +50,19 @@ AgentRunResult AgentController::Run(
         {{"role", "user"}, {"content", objective}},
     });
 
+    bool supportsImageInput = false;
+    try
+    {
+        supportsImageInput = llama_.SupportsImageInput();
+    }
+    catch (const std::exception& error)
+    {
+        // A catalog failure should not block text-only gameplay.
+        if (trace)
+            trace("[MODEL CAPABILITIES] Screenshot tool disabled: " + std::string(error.what()));
+    }
+    const auto toolDefinitions = tools_.Definitions(supportsImageInput);
+
     AgentRunResult result;
     for (int round = 1; round <= maximumRounds; ++round)
     {
@@ -54,9 +73,20 @@ AgentRunResult AgentController::Run(
         }
 
         result.rounds = round;
-        if (trace) trace("AI round " + std::to_string(round));
-        auto turn = llama_.Complete(messages, tools_.Definitions());
+        if (trace)
+        {
+            trace("========== AGENT ROUND " + std::to_string(round) + " OF " +
+                std::to_string(maximumRounds) + " ==========");
+        }
+        auto turn = llama_.Complete(messages, toolDefinitions, trace);
         messages.push_back(turn.assistantMessage);
+
+        if (trace && !turn.toolCalls.empty())
+        {
+            trace("[MODEL DECISION]\n" + (turn.content.empty()
+                ? std::string("The model did not return a visible decision summary.")
+                : turn.content));
+        }
 
         if (turn.toolCalls.empty())
         {
@@ -75,7 +105,10 @@ AgentRunResult AgentController::Run(
                 return result;
             }
 
-            if (trace) trace("Tool " + call.name + " " + call.arguments.dump());
+            if (trace)
+            {
+                trace("[TOOL CALL] " + call.name + "\nArguments:\n" + call.arguments.dump(2));
+            }
             json toolResult;
             try
             {
@@ -96,7 +129,10 @@ AgentRunResult AgentController::Run(
                     toolResult["result"]["image_attached"] = true;
                 }
             }
-            if (trace) trace("Result " + toolResult.dump());
+            if (trace)
+            {
+                trace("[TOOL RESULT] " + call.name + "\n" + toolResult.dump(2));
+            }
             messages.push_back({
                 {"role", "tool"},
                 {"tool_call_id", call.id},

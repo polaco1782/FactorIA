@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>
+#include <string_view>
 
 #include <httplib.h>
 
@@ -39,6 +40,12 @@ json ParseJsonBody(const httplib::Result& response, const std::string& action)
     }
 }
 
+void ThrowIfProviderError(const json& body)
+{
+    if (const auto error = body.find("error"); error != body.end() && error->is_object())
+        throw std::runtime_error("AI provider error: " + error->value("message", "unknown error"));
+}
+
 json ParseToolArguments(const json& value)
 {
     if (value.is_object())
@@ -61,6 +68,88 @@ httplib::Headers OpenRouterHeaders(const std::string& token)
         {"Authorization", "Bearer " + token},
         {"X-OpenRouter-Title", "FactorIA"},
     };
+}
+
+std::string JsonText(const json& object, std::string_view key, std::string_view fallback = "unknown")
+{
+    if (!object.is_object())
+        return std::string(fallback);
+    const auto value = object.find(key);
+    return value != object.end() && value->is_string()
+        ? value->get<std::string>()
+        : std::string(fallback);
+}
+
+std::string JsonNumber(const json& object, std::string_view key)
+{
+    if (!object.is_object())
+        return "unknown";
+    const auto value = object.find(key);
+    return value != object.end() && value->is_number() ? value->dump() : "unknown";
+}
+
+std::size_t JsonArraySize(const json& object, std::string_view key)
+{
+    if (!object.is_object())
+        return 0;
+    const auto value = object.find(key);
+    return value != object.end() && value->is_array() ? value->size() : 0;
+}
+
+void TraceModelRequest(const LlamaClient::TraceHandler& trace, const json& request)
+{
+    if (trace)
+    {
+        trace("[MODEL REQUEST] Model: " + JsonText(request, "model") +
+            " | Context: " + std::to_string(JsonArraySize(request, "messages")) +
+            " messages | Available tools: " + std::to_string(JsonArraySize(request, "tools")));
+    }
+}
+
+void TraceModelResponse(const LlamaClient::TraceHandler& trace, const json& body)
+{
+    if (!trace)
+        return;
+
+    const json* choice = nullptr;
+    if (const auto choices = body.find("choices");
+        choices != body.end() && choices->is_array() && !choices->empty() && choices->front().is_object())
+    {
+        choice = &choices->front();
+    }
+
+    const json* message = nullptr;
+    if (choice)
+    {
+        const auto candidate = choice->find("message");
+        if (candidate != choice->end() && candidate->is_object())
+            message = &*candidate;
+    }
+
+    const auto toolCallCount = message ? JsonArraySize(*message, "tool_calls") : 0;
+    std::string summary = "[MODEL RESPONSE] Model: " + JsonText(body, "model") +
+        " | Finish: " + (choice ? JsonText(*choice, "finish_reason") : "unknown") +
+        " | Tool calls: " + std::to_string(toolCallCount);
+
+    if (const auto usage = body.find("usage"); usage != body.end() && usage->is_object())
+    {
+        summary += "\nTokens: prompt " + JsonNumber(*usage, "prompt_tokens") +
+            " | completion " + JsonNumber(*usage, "completion_tokens") +
+            " | total " + JsonNumber(*usage, "total_tokens");
+    }
+
+    // Tool-taking decisions are logged by AgentController beside the actual call and result.
+    if (message && toolCallCount == 0)
+    {
+        const auto content = message->find("content");
+        if (content != message->end() && content->is_string() && !content->get_ref<const std::string&>().empty())
+            summary += "\nAssistant:\n" + content->get<std::string>();
+    }
+
+    if (const auto error = body.find("error"); error != body.end() && error->is_object())
+        summary += "\nProvider error: " + JsonText(*error, "message");
+
+    trace(summary);
 }
 }
 
@@ -92,7 +181,71 @@ void LlamaClient::CheckHealth() const
         throw std::runtime_error("llama.cpp is reachable but the model is not ready");
 }
 
-LlamaTurn LlamaClient::Complete(const json& messages, const json& tools) const
+std::vector<std::string> LlamaClient::ListToolModels() const
+{
+    if (!IsOpenRouter())
+        throw std::runtime_error("The model catalog is available only for OpenRouter");
+
+    const auto body = ModelCatalog();
+    const auto data = body.find("data");
+    if (data == body.end() || !data->is_array())
+        throw std::runtime_error("OpenRouter returned an invalid model catalog");
+
+    std::vector<std::string> models;
+    models.reserve(data->size());
+    for (const auto& model : *data)
+    {
+        if (!model.is_object())
+            continue;
+        const auto supported = model.find("supported_parameters");
+        if (supported == model.end() || !supported->is_array() ||
+            std::find(supported->begin(), supported->end(), "tools") == supported->end())
+        {
+            continue;
+        }
+
+        const auto id = model.find("id");
+        if (id != model.end() && id->is_string() && !id->get_ref<const std::string&>().empty())
+            models.push_back(id->get<std::string>());
+    }
+
+    std::ranges::sort(models);
+    const auto duplicates = std::ranges::unique(models);
+    models.erase(duplicates.begin(), duplicates.end());
+    if (models.empty())
+        throw std::runtime_error("OpenRouter returned no tool-capable models for this API key");
+    return models;
+}
+
+bool LlamaClient::SupportsImageInput() const
+{
+    // Local OpenAI-compatible servers do not expose a standard capability catalog.
+    if (!IsOpenRouter())
+        return true;
+
+    const auto body = ModelCatalog();
+    const auto data = body.find("data");
+    if (data == body.end() || !data->is_array())
+        throw std::runtime_error("OpenRouter returned an invalid model catalog");
+
+    for (const auto& model : *data)
+    {
+        if (!model.is_object() || model.value("id", std::string{}) != model_)
+            continue;
+        const auto architecture = model.find("architecture");
+        if (architecture == model.end() || !architecture->is_object())
+            return false;
+        const auto modalities = architecture->find("input_modalities");
+        return modalities != architecture->end() && modalities->is_array() &&
+            std::find(modalities->begin(), modalities->end(), "image") != modalities->end();
+    }
+    return false;
+}
+
+LlamaTurn LlamaClient::Complete(
+    const json& messages,
+    const json& tools,
+    const TraceHandler& trace) const
 {
     if (!messages.is_array() || messages.empty())
         throw std::runtime_error("An AI completion requires at least one message");
@@ -111,6 +264,7 @@ LlamaTurn LlamaClient::Complete(const json& messages, const json& tools) const
         request["tools"] = tools;
         request["tool_choice"] = "auto";
     }
+    TraceModelRequest(trace, request);
 
     httplib::Client client(endpoint_.origin);
     client.set_connection_timeout(std::chrono::seconds(10));
@@ -120,8 +274,8 @@ LlamaTurn LlamaClient::Complete(const json& messages, const json& tools) const
         ? client.Post(ChatPath(), OpenRouterHeaders(bearerToken_), request.dump(), "application/json")
         : client.Post(ChatPath(), request.dump(), "application/json");
     const auto body = ParseJsonBody(response, IsOpenRouter() ? "OpenRouter completion" : "llama.cpp completion");
-    if (const auto error = body.find("error"); error != body.end() && error->is_object())
-        throw std::runtime_error("AI provider error: " + error->value("message", "unknown error"));
+    TraceModelResponse(trace, body);
+    ThrowIfProviderError(body);
 
     const auto choices = body.find("choices");
     if (choices == body.end() || !choices->is_array() || choices->empty())
@@ -201,6 +355,26 @@ std::string LlamaClient::KeyPath() const
     if (endpoint_.basePath.ends_with("/v1"))
         return endpoint_.basePath + "/key";
     return endpoint_.basePath + "/v1/key";
+}
+
+std::string LlamaClient::ModelsPath() const
+{
+    if (endpoint_.basePath.empty())
+        return "/v1/models/user";
+    if (endpoint_.basePath.ends_with("/v1"))
+        return endpoint_.basePath + "/models/user";
+    return endpoint_.basePath + "/v1/models/user";
+}
+
+nlohmann::json LlamaClient::ModelCatalog() const
+{
+    httplib::Client client(endpoint_.origin);
+    client.set_connection_timeout(std::chrono::seconds(10));
+    client.set_read_timeout(std::chrono::seconds(30));
+    const auto response = client.Get(ModelsPath(), OpenRouterHeaders(bearerToken_));
+    auto body = ParseJsonBody(response, "OpenRouter model catalog");
+    ThrowIfProviderError(body);
+    return body;
 }
 
 bool LlamaClient::IsOpenRouter() const noexcept

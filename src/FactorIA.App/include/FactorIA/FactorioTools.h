@@ -1,7 +1,9 @@
 #pragma once
 
-#include <functional>
+#include <chrono>
+#include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <stop_token>
 #include <string>
 
@@ -16,7 +18,7 @@ public:
 
     FactorioTools(CommandExecutor executeCommand, std::filesystem::path factorioUserDataPath);
 
-    [[nodiscard]] const nlohmann::json& Definitions() const noexcept;
+    [[nodiscard]] nlohmann::json Definitions(bool includeScreenshot = true) const;
     nlohmann::json Execute(
         const std::string& name,
         const nlohmann::json& arguments,
@@ -24,8 +26,17 @@ public:
 
 private:
     nlohmann::json ExecuteJson(const std::string& body) const;
+    void EnsurePlayerControlAction() const;
+    nlohmann::json StartPlayerControlAction(const nlohmann::json& arguments) const;
+    nlohmann::json PollPlayerControlAction(std::uint64_t jobId) const;
+    nlohmann::json StopPlayerControlAction(std::uint64_t jobId) const;
+    nlohmann::json WaitForPlayerControlAction(
+        const nlohmann::json& startResult,
+        std::chrono::steady_clock::time_point deadline,
+        std::stop_token stopToken) const;
     nlohmann::json GetGameState() const;
     nlohmann::json GetInventory() const;
+    nlohmann::json GetCraftableRecipes() const;
     nlohmann::json GetNearbyEntities(const nlohmann::json& arguments) const;
     nlohmann::json FindResourcePatches(const nlohmann::json& arguments) const;
     nlohmann::json Walk(const nlohmann::json& arguments, std::stop_token stopToken) const;
@@ -35,9 +46,14 @@ private:
     nlohmann::json TakeScreenshot(const nlohmann::json& arguments, std::stop_token stopToken) const;
     nlohmann::json MineEntity(const nlohmann::json& arguments, std::stop_token stopToken) const;
     nlohmann::json Craft(const nlohmann::json& arguments) const;
+    nlohmann::json PlaceEntity(const nlohmann::json& arguments) const;
+    nlohmann::json InsertItemIntoEntity(const nlohmann::json& arguments) const;
+    nlohmann::json TakeItemFromEntity(const nlohmann::json& arguments) const;
+    nlohmann::json TransferInventoryToContainer(const nlohmann::json& arguments) const;
 
     CommandExecutor executeCommand_;
     std::filesystem::path factorioUserDataPath_;
     nlohmann::json definitions_;
+    mutable bool playerControlActionReady_ = false;
 };
 }

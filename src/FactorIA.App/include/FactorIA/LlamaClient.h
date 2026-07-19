@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -24,12 +25,17 @@ struct LlamaTurn
 class LlamaClient
 {
 public:
+    using TraceHandler = std::function<void(const std::string&)>;
+
     LlamaClient(std::string baseUrl, std::string model, std::string bearerToken = {});
 
     void CheckHealth() const;
+    [[nodiscard]] std::vector<std::string> ListToolModels() const;
+    [[nodiscard]] bool SupportsImageInput() const;
     LlamaTurn Complete(
         const nlohmann::json& messages,
-        const nlohmann::json& tools) const;
+        const nlohmann::json& tools,
+        const TraceHandler& trace = {}) const;
 
 private:
     struct Endpoint
@@ -41,6 +47,8 @@ private:
     static Endpoint ParseEndpoint(const std::string& baseUrl);
     std::string ChatPath() const;
     std::string KeyPath() const;
+    std::string ModelsPath() const;
+    nlohmann::json ModelCatalog() const;
     [[nodiscard]] bool IsOpenRouter() const noexcept;
 
     Endpoint endpoint_;

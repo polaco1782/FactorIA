@@ -1,6 +1,5 @@
 #pragma once
 
-#include <functional>
 #include <stop_token>
 #include <string>
 
@@ -19,7 +18,7 @@ struct AgentRunResult
 class AgentController
 {
 public:
-    using TraceHandler = std::function<void(const std::string&)>;
+    using TraceHandler = LlamaClient::TraceHandler;
 
     AgentController(LlamaClient llama, FactorioTools& tools);
     AgentRunResult Run(
@@ -33,4 +32,3 @@ private:
     FactorioTools& tools_;
 };
 }
-
