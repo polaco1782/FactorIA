@@ -30,7 +30,7 @@ public:
     LlamaClient(std::string baseUrl, std::string model, std::string bearerToken = {});
 
     void CheckHealth() const;
-    [[nodiscard]] std::vector<std::string> ListToolModels() const;
+    [[nodiscard]] std::vector<std::string> ListToolModels(bool freeOnly = false) const;
     [[nodiscard]] bool SupportsImageInput() const;
     LlamaTurn Complete(
         const nlohmann::json& messages,

@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include <wx/button.h>
+#include <wx/checkbox.h>
 #include <wx/choice.h>
 #include <wx/datetime.h>
 #include <wx/notebook.h>
@@ -118,6 +119,7 @@ void MainFrame::BuildUi()
     rconPort_->SetRange(1, 65535);
     rconPassword_ = new wxTextCtrl(connectionPanel, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize, wxTE_PASSWORD);
     factorioUserDataPath_ = new wxTextCtrl(connectionPanel, wxID_ANY);
+    useDedicatedAiCharacter_ = new wxCheckBox(connectionPanel, wxID_ANY, "Use dedicated AI character");
     factorioGrid->Add(new wxStaticText(connectionPanel, wxID_ANY, "Host"), 0, wxALIGN_CENTER_VERTICAL);
     factorioGrid->Add(rconHost_, 1, wxEXPAND);
     factorioGrid->Add(new wxStaticText(connectionPanel, wxID_ANY, "Port"), 0, wxALIGN_CENTER_VERTICAL);
@@ -126,6 +128,8 @@ void MainFrame::BuildUi()
     factorioGrid->Add(rconPassword_, 1, wxEXPAND);
     factorioGrid->Add(new wxStaticText(connectionPanel, wxID_ANY, "User data directory"), 0, wxALIGN_CENTER_VERTICAL);
     factorioGrid->Add(factorioUserDataPath_, 1, wxEXPAND);
+    factorioGrid->Add(new wxStaticText(connectionPanel, wxID_ANY, "Agent control"), 0, wxALIGN_CENTER_VERTICAL);
+    factorioGrid->Add(useDedicatedAiCharacter_, 1, wxEXPAND);
     factorioBox->Add(factorioGrid, 0, wxEXPAND | wxALL, 10);
 
     auto* stateRow = new wxBoxSizer(wxHORIZONTAL);
@@ -150,6 +154,7 @@ void MainFrame::BuildUi()
     openRouterApiKey_ = new wxTextCtrl(
         connectionPanel, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize, wxTE_PASSWORD);
     openRouterModel_ = new wxChoice(connectionPanel, wxID_ANY);
+    openRouterFreeModelsOnly_ = new wxCheckBox(connectionPanel, wxID_ANY, "Free models only");
     fetchOpenRouterModelsButton_ = new wxButton(connectionPanel, wxID_ANY, "Fetch models");
     llamaGrid->Add(new wxStaticText(connectionPanel, wxID_ANY, "Provider"), 0, wxALIGN_CENTER_VERTICAL);
     llamaGrid->Add(aiProvider_, 1, wxEXPAND);
@@ -162,6 +167,7 @@ void MainFrame::BuildUi()
     llamaGrid->Add(new wxStaticText(connectionPanel, wxID_ANY, "OpenRouter Model"), 0, wxALIGN_CENTER_VERTICAL);
     auto* openRouterModelRow = new wxBoxSizer(wxHORIZONTAL);
     openRouterModelRow->Add(openRouterModel_, 1, wxEXPAND | wxRIGHT, 8);
+    openRouterModelRow->Add(openRouterFreeModelsOnly_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
     openRouterModelRow->Add(fetchOpenRouterModelsButton_);
     llamaGrid->Add(openRouterModelRow, 1, wxEXPAND);
     llamaBox->Add(llamaGrid, 0, wxEXPAND | wxALL, 10);
@@ -182,19 +188,21 @@ void MainFrame::BuildUi()
     auto* agentRoot = new wxBoxSizer(wxVERTICAL);
     auto* objectiveBox = new wxStaticBoxSizer(wxVERTICAL, agentPanel, "Objective");
     objective_ = new wxTextCtrl(agentPanel, wxID_ANY,
-        "Observe the player and report the current position and inventory.",
+        "Observe the controlled character and report the current position and inventory.",
         wxDefaultPosition, wxDefaultSize, wxTE_MULTILINE);
     objectiveBox->Add(objective_, 1, wxEXPAND | wxALL, 8);
 
     auto* agentControls = new wxBoxSizer(wxHORIZONTAL);
     maximumRounds_ = new wxSpinCtrl(agentPanel, wxID_ANY);
-    maximumRounds_->SetRange(1, 50);
+    maximumRounds_->SetRange(AgentController::MinimumRounds, AgentController::MaximumRounds);
     maximumRounds_->SetValue(12);
+    nonStopAgentRun_ = new wxCheckBox(agentPanel, wxID_ANY, "Non-stop run");
     agentRunButton_ = new wxButton(agentPanel, wxID_ANY, "Run objective");
     agentStopButton_ = new wxButton(agentPanel, wxID_ANY, "Stop");
     agentStatus_ = new wxStaticText(agentPanel, wxID_ANY, "Idle");
     agentControls->Add(new wxStaticText(agentPanel, wxID_ANY, "Maximum AI rounds"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
     agentControls->Add(maximumRounds_, 0, wxRIGHT, 12);
+    agentControls->Add(nonStopAgentRun_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
     agentControls->Add(agentRunButton_, 0, wxRIGHT, 8);
     agentControls->Add(agentStopButton_, 0, wxRIGHT, 12);
     agentControls->Add(agentStatus_, 1, wxALIGN_CENTER_VERTICAL);
@@ -221,6 +229,7 @@ void MainFrame::BuildUi()
     llamaTestButton_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { TestLlama(); });
     fetchOpenRouterModelsButton_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { FetchOpenRouterModels(); });
     aiProvider_->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { UpdateAiProviderControls(); });
+    nonStopAgentRun_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { UpdateAgentRoundControls(); });
     agentRunButton_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { RunAgent(); });
     agentStopButton_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { StopAgent(); });
     agentRunButton_->Disable();
@@ -236,6 +245,7 @@ void MainFrame::LoadSettingsIntoControls()
     llamaModel_->SetValue(FromUtf8(settings_.llamaModel));
     aiProvider_->SetSelection(settings_.aiProvider == "openrouter" ? 1 : 0);
     openRouterApiKey_->SetValue(FromUtf8(settings_.openRouterApiKey));
+    openRouterFreeModelsOnly_->SetValue(settings_.openRouterFreeModelsOnly);
     openRouterModel_->Clear();
     if (!settings_.openRouterModel.empty())
     {
@@ -243,7 +253,10 @@ void MainFrame::LoadSettingsIntoControls()
         openRouterModel_->SetSelection(0);
     }
     factorioUserDataPath_->SetValue(FromPath(settings_.factorioUserDataPath));
+    useDedicatedAiCharacter_->SetValue(settings_.useDedicatedAiCharacter);
+    nonStopAgentRun_->SetValue(settings_.nonStopAgentRun);
     UpdateAiProviderControls();
+    UpdateAgentRoundControls();
 }
 
 void MainFrame::UpdateAiProviderControls()
@@ -253,8 +266,14 @@ void MainFrame::UpdateAiProviderControls()
     llamaModel_->Enable(!openRouter);
     openRouterApiKey_->Enable(openRouter);
     openRouterModel_->Enable(openRouter);
+    openRouterFreeModelsOnly_->Enable(openRouter);
     fetchOpenRouterModelsButton_->Enable(openRouter);
     llamaStatus_->SetLabel("Not tested");
+}
+
+void MainFrame::UpdateAgentRoundControls()
+{
+    maximumRounds_->Enable(!nonStopAgentRun_->GetValue());
 }
 
 AppSettings MainFrame::ReadSettingsFromControls() const
@@ -268,6 +287,9 @@ AppSettings MainFrame::ReadSettingsFromControls() const
     result.aiProvider = aiProvider_->GetSelection() == 1 ? "openrouter" : "llama_cpp";
     result.openRouterApiKey = openRouterApiKey_->GetValue().ToStdString();
     result.openRouterModel = openRouterModel_->GetStringSelection().ToStdString();
+    result.openRouterFreeModelsOnly = openRouterFreeModelsOnly_->GetValue();
+    result.useDedicatedAiCharacter = useDedicatedAiCharacter_->GetValue();
+    result.nonStopAgentRun = nonStopAgentRun_->GetValue();
 #ifdef _WIN32
     result.factorioUserDataPath = std::filesystem::path(factorioUserDataPath_->GetValue().ToStdWstring());
 #else
@@ -392,32 +414,40 @@ void MainFrame::FetchOpenRouterModels()
         return;
     }
 
-    StartWork("Fetching tool-capable OpenRouter models", [this, requested](std::stop_token) {
-        auto models = CreateAiClient(requested).ListToolModels();
-        CallAfter([this, models = std::move(models), selected = requested.openRouterModel] {
-            openRouterModel_->Freeze();
-            openRouterModel_->Clear();
-            for (const auto& model : models)
-                openRouterModel_->Append(FromUtf8(model));
-            const auto previous = openRouterModel_->FindString(FromUtf8(selected));
-            if (previous != wxNOT_FOUND)
-                openRouterModel_->SetSelection(previous);
-            openRouterModel_->Thaw();
+    StartWork(requested.openRouterFreeModelsOnly
+            ? "Fetching free tool-capable OpenRouter models"
+            : "Fetching tool-capable OpenRouter models",
+        [this, requested](std::stop_token) {
+            auto models = CreateAiClient(requested).ListToolModels(requested.openRouterFreeModelsOnly);
+            CallAfter([this,
+                          models = std::move(models),
+                          selected = requested.openRouterModel,
+                          freeOnly = requested.openRouterFreeModelsOnly] {
+                openRouterModel_->Freeze();
+                openRouterModel_->Clear();
+                for (const auto& model : models)
+                    openRouterModel_->Append(FromUtf8(model));
+                const auto previous = openRouterModel_->FindString(FromUtf8(selected));
+                if (previous != wxNOT_FOUND)
+                    openRouterModel_->SetSelection(previous);
+                openRouterModel_->Thaw();
 
-            AppendLog("Fetched " + wxString::Format("%zu", models.size()) +
-                " tool-capable OpenRouter models" +
-                (previous == wxNOT_FOUND && !selected.empty()
-                    ? "; the previously selected model is no longer available"
-                    : ""));
+                AppendLog("Fetched " + wxString::Format("%zu", models.size()) +
+                    (freeOnly
+                        ? " free tool-capable OpenRouter models"
+                        : " tool-capable OpenRouter models") +
+                    (previous == wxNOT_FOUND && !selected.empty()
+                        ? "; the previously selected model is no longer available"
+                        : ""));
+            });
         });
-    });
 }
 
 void MainFrame::RunAgent()
 {
     AppSettings requested;
     std::string objective;
-    int maximumRounds = 0;
+    std::optional<int> maximumRounds;
     try
     {
         requested = ReadSettingsFromControls();
@@ -425,7 +455,8 @@ void MainFrame::RunAgent()
         if (requested.factorioUserDataPath.empty())
             throw std::runtime_error("Factorio user data directory cannot be empty");
         objective = objective_->GetValue().ToStdString();
-        maximumRounds = maximumRounds_->GetValue();
+        if (!requested.nonStopAgentRun)
+            maximumRounds = maximumRounds_->GetValue();
         if (objective.empty())
             throw std::runtime_error("Agent objective cannot be empty");
         std::scoped_lock lock(clientMutex_);
@@ -448,7 +479,7 @@ void MainFrame::RunAgent()
             if (!rconClient_ || !rconClient_->IsConnected())
                 throw std::runtime_error("Factorio RCON disconnected during the agent run");
             return rconClient_->Execute(command);
-        }, requested.factorioUserDataPath);
+        }, requested.factorioUserDataPath, requested.useDedicatedAiCharacter);
         AgentController controller(CreateAiClient(requested), tools);
         const auto result = controller.Run(objective, maximumRounds, stopToken, [this](const std::string& trace) {
             CallAfter([this, text = FromUtf8(trace)] { AppendLog(text); });
@@ -484,6 +515,7 @@ void MainFrame::StartWork(
     disconnectButton_->Disable();
     testButton_->Disable();
     llamaTestButton_->Disable();
+    openRouterFreeModelsOnly_->Disable();
     fetchOpenRouterModelsButton_->Disable();
     agentRunButton_->Disable();
     agentStopButton_->Enable(enableStop);
@@ -515,7 +547,9 @@ void MainFrame::FinishWork()
 {
     connectButton_->Enable();
     llamaTestButton_->Enable();
-    fetchOpenRouterModelsButton_->Enable(aiProvider_->GetSelection() == 1);
+    const auto openRouter = aiProvider_->GetSelection() == 1;
+    openRouterFreeModelsOnly_->Enable(openRouter);
+    fetchOpenRouterModelsButton_->Enable(openRouter);
     agentStopButton_->Disable();
     std::scoped_lock lock(clientMutex_);
     const auto connected = rconClient_ && rconClient_->IsConnected();

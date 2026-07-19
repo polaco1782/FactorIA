@@ -16,7 +16,10 @@ class FactorioTools
 public:
     using CommandExecutor = std::function<std::string(const std::string&)>;
 
-    FactorioTools(CommandExecutor executeCommand, std::filesystem::path factorioUserDataPath);
+    FactorioTools(
+        CommandExecutor executeCommand,
+        std::filesystem::path factorioUserDataPath,
+        bool useDedicatedCharacter = false);
 
     [[nodiscard]] nlohmann::json Definitions(bool includeScreenshot = true) const;
     nlohmann::json Execute(
@@ -26,6 +29,7 @@ public:
 
 private:
     nlohmann::json ExecuteJson(const std::string& body) const;
+    [[nodiscard]] std::string ControlCharacterLua() const;
     void EnsurePlayerControlAction() const;
     nlohmann::json StartPlayerControlAction(const nlohmann::json& arguments) const;
     nlohmann::json PollPlayerControlAction(std::uint64_t jobId) const;
@@ -49,10 +53,14 @@ private:
     nlohmann::json PlaceEntity(const nlohmann::json& arguments) const;
     nlohmann::json InsertItemIntoEntity(const nlohmann::json& arguments) const;
     nlohmann::json TakeItemFromEntity(const nlohmann::json& arguments) const;
+    nlohmann::json WaitForMachineOutput(
+        const nlohmann::json& arguments,
+        std::stop_token stopToken) const;
     nlohmann::json TransferInventoryToContainer(const nlohmann::json& arguments) const;
 
     CommandExecutor executeCommand_;
     std::filesystem::path factorioUserDataPath_;
+    bool useDedicatedCharacter_{};
     nlohmann::json definitions_;
     mutable bool playerControlActionReady_ = false;
 };

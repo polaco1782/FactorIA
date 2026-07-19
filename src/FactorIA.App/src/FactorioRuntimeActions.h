@@ -21,22 +21,22 @@ local directions = {
     northwest = defines.direction.northwest
 }
 
-local function connected_player()
-    local player = game.connected_players[1]
-    if not player or not player.valid or not player.character then
-        error("No connected FactorIA player with a character")
+local function control_character(use_dedicated_character)
+    local interface = remote.interfaces.factoria_bridge
+    if not interface or not interface.get_control_character then
+        error("The updated FactorIA Bridge mod is required to select a control character")
     end
-    return player
+    return remote.call("factoria_bridge", "get_control_character", use_dedicated_character == true)
 end
 
 local function stop_walking(player)
-    if player and player.valid and player.character then
+    if player and player.valid then
         player.walking_state = {walking = false, direction = defines.direction.north}
     end
 end
 
 local function stop_mining(player)
-    if player and player.valid and player.character then
+    if player and player.valid then
         player.mining_state = {mining = false}
     end
 end
@@ -82,7 +82,7 @@ local function completed_walk_result(state, timed_out, blocked)
 end
 
 function action.start(arguments)
-    local player = connected_player()
+    local player = control_character(arguments.use_dedicated_character)
     local kind = arguments.kind
 
     if kind == "walk_direction" then
@@ -164,7 +164,7 @@ function action.start(arguments)
 end
 
 local function tick_directional_walk(state)
-    if not state.player.valid or not state.player.character then
+    if not state.player.valid then
         return true, {reached = false, player_unavailable = true}
     end
     if game.tick >= state.deadline_tick then
@@ -176,7 +176,7 @@ local function tick_directional_walk(state)
 end
 
 local function tick_path_walk(state)
-    if not state.player.valid or not state.player.character then
+    if not state.player.valid then
         return true, {reached = false, player_unavailable = true}
     end
     if game.tick >= state.deadline_tick then
@@ -229,7 +229,7 @@ end
 
 local function tick_mining(state)
     local count = mined_count(state)
-    if not state.player.valid or not state.player.character then
+    if not state.player.valid then
         stop_mining(state.player)
         return true, with_mining_counts(state, {
             mined = count > 0,
@@ -293,7 +293,7 @@ function action.tick(state)
 end
 
 function action.status(state)
-    if not state.player.valid or not state.player.character then
+    if not state.player.valid then
         return {player_unavailable = true}
     elseif state.kind == "walk_direction" then
         return {position = position_of(state.player)}

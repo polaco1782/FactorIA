@@ -11,13 +11,14 @@ The initial application shell provides:
 - a portable Asio Source RCON client;
 - RCON authentication, disconnect, and a controlled Factorio status command;
 - local and hosted provider connection tests plus OpenAI-compatible tool-call parsing;
-- a bounded observe/decide/execute agent loop with cancellation between calls;
+- a bounded or non-stop observe/decide/execute agent loop with cancellation between calls;
 - typed game-state, inventory, craftability, nearby-entity, walking, stop, crafting, placement, machine-inventory, and container-transfer tools;
 - nearest-first spatial scans, coordinate-targeted walking, and continuous counted resource mining;
 - long-range resource surveys that group ore into patch regions and provide exact walking targets;
 - model-visible screenshots through Factorio's `script-output` directory;
 - collision-aware `walk_to` routing and tick-synchronized walking and mining through the bundled FactorIA Bridge mod;
-- an Agent tab for objectives, execution limits, final output, and full tool tracing;
+- optional persistent AI-owned character control, keeping the human player's character and inventory separate;
+- an Agent tab for objectives, execution limits up to 999 rounds, optional non-stop execution, final output, and full tool tracing;
 - a structured, timestamped application log containing redacted model requests, provider responses, decision summaries, tool calls, and tool results.
 
 ## Requirements
@@ -50,6 +51,12 @@ FactorIA uploads its trusted player-control action module over RCON in small chu
 actions on every game tick. Uploaded functions are session-local and are automatically uploaded again after a
 save load or mod reload. Only typed, validated tools are exposed to the model; model-generated Lua is never run.
 
+Enable **Use dedicated AI character** in the Connections tab to make the bridge create and persist a separate
+blue character on the normal player force. Every observation and action then targets that character, including
+inventory, crafting, movement, mining, building, pathfinding, and screenshots. Leave the option disabled to keep
+controlling the first connected player's character. The dedicated character starts with an empty inventory and
+must gather its own resources.
+
 ## Screenshot tool
 
 Set **Factorio user data directory** on the Connections tab. FactorIA asks non-headless Factorio to write a PNG
@@ -71,7 +78,8 @@ token usage, final assistant content, and the agent's observable decision, tool 
 
 Select **OpenRouter** on the Connections tab, enter an API key, and choose **Fetch models**. FactorIA loads the
 tool-capable models available under the key's provider preferences, privacy settings, and guardrails; select one
-from the dropdown and use **Test AI provider**. FactorIA connects to `https://openrouter.ai/api/v1`, authenticates
+from the dropdown and use **Test AI provider**. Enable **Free models only** before fetching to include only models
+whose catalog pricing reports zero prompt and completion cost. FactorIA connects to `https://openrouter.ai/api/v1`, authenticates
 with a Bearer token, and uses the same bounded tool loop as the local provider.
 
 The API key is stored in the same local `FactorIA/settings.json` file as the existing connection credentials

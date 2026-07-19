@@ -1,5 +1,5 @@
 local interface_name = "factoria_bridge"
-local runtime_version = 1
+local runtime_version = 2
 local result_lifetime_ticks = 60 * 60
 
 -- Uploaded actions are intentionally session-local because functions cannot be serialized in storage.
@@ -11,6 +11,65 @@ local next_job_id = 1
 
 local function ensure_storage()
     storage.path_results = storage.path_results or {}
+end
+
+local function connected_character()
+    local player = game.connected_players[1]
+    if not player or not player.valid or not player.character or not player.character.valid then
+        error("No connected Factorio player with a character")
+    end
+    return player.character
+end
+
+local function ensure_agent_character()
+    ensure_storage()
+    if storage.agent_character and storage.agent_character.valid then
+        return storage.agent_character
+    end
+
+    local surface = game.get_surface("nauvis") or game.surfaces[1]
+    if not surface then
+        error("No surface is available for the FactorIA character")
+    end
+
+    local force = game.forces.player
+    local anchor = force.get_spawn_position(surface)
+    local position = nil
+    local connected = game.connected_players[1]
+    if connected and connected.valid and connected.character and connected.character.valid then
+        surface = connected.surface
+        anchor = {x = connected.position.x + 3, y = connected.position.y}
+        position = surface.find_non_colliding_position("character", anchor, 32, 0.5)
+    end
+
+    if not position then
+        surface = game.get_surface("nauvis") or game.surfaces[1]
+        anchor = force.get_spawn_position(surface)
+        position = surface.find_non_colliding_position("character", anchor, 32, 0.5)
+    end
+    if not position then
+        error("No free position is available for the FactorIA character")
+    end
+
+    local character = surface.create_entity {
+        name = "character",
+        position = position,
+        force = force
+    }
+    if not character then
+        error("Factorio could not create the FactorIA character")
+    end
+
+    character.color = {r = 0.2, g = 0.75, b = 1.0, a = 1.0}
+    storage.agent_character = character
+    return character
+end
+
+local function control_character(use_dedicated_character)
+    if use_dedicated_character then
+        return ensure_agent_character()
+    end
+    return connected_character()
 end
 
 local function stop_job_control(job)
@@ -106,6 +165,21 @@ script.on_event(defines.events.on_tick, function()
 end)
 
 remote.add_interface(interface_name, {
+    get_control_character = function(use_dedicated_character)
+        return control_character(use_dedicated_character == true)
+    end,
+
+    control_character_info = function(use_dedicated_character)
+        local character = control_character(use_dedicated_character == true)
+        return {
+            dedicated = use_dedicated_character == true,
+            unit_number = character.unit_number,
+            position = character.position,
+            surface = character.surface.name,
+            force = character.force.name
+        }
+    end,
+
     runtime_info = function(action_name)
         return {
             version = runtime_version,
@@ -221,22 +295,15 @@ remote.add_interface(interface_name, {
         return {active = false, job_id = job_id, result = result}
     end,
 
-    request_path = function(player_index, target_x, target_y, radius)
+    request_path = function(use_dedicated_character, target_x, target_y, radius)
         ensure_storage()
-        local player = game.get_player(player_index)
-        if not player or not player.valid then
-            error("FactorIA player is not available")
-        end
-        local character = player.character
-        if not character or not character.valid then
-            error("FactorIA player has no character")
-        end
-        return player.surface.request_path {
+        local character = control_character(use_dedicated_character == true)
+        return character.surface.request_path {
             bounding_box = character.prototype.collision_box,
             collision_mask = character.prototype.collision_mask,
-            start = player.position,
+            start = character.position,
             goal = {x = target_x, y = target_y},
-            force = player.force,
+            force = character.force,
             radius = radius,
             pathfind_flags = {
                 allow_destroy_friendly_entities = false,

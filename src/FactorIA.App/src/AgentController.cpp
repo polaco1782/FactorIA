@@ -11,7 +11,7 @@ namespace
 {
 using json = nlohmann::json;
 
-constexpr const char* SystemPrompt = R"(You are controlling one player in Factorio through typed tools.
+constexpr const char* SystemPrompt = R"(You are controlling one character in Factorio through typed tools.
 Observe the game before acting. Use only tool results as facts about the world.
 Take one small gameplay action at a time, then observe its result.
 Before every tool call, include a brief decision summary in the assistant message: state the relevant observation, the action chosen, and why it advances the objective.
@@ -22,9 +22,10 @@ To gather resources, walk within reach and call mine_entity with a useful batch 
 When you need to decide what can be made from the current inventory, call get_craftable_recipes instead of guessing recipe availability.
 To build a crafted entity, call place_entity on a nearby open tile; use the returned exact entity position for later interactions.
 To operate a furnace, insert fuel with inventory='fuel', insert ore with inventory='input', inspect the furnace with get_nearby_entities, and collect plates with take_item_from_entity using inventory='output'.
+After loading a furnace or crafting-machine batch, call wait_for_machine_output once with the expected total output and a sufficient timeout. Never spend model rounds polling get_nearby_entities for production progress.
 To empty the player's inventory into a chest or logistic container, walk within reach and call transfer_inventory_to_container with the container's exact position.
 Use take_screenshot when spatial context would materially help and image capture is available.
-Nearby-entity results return distinct prototypes before duplicate instances. If the target is not present and next_offset is returned, inspect the next page before concluding that it is absent. Use exact name or type filters to inspect additional instances after discovering their prototype.
+When looking for a known entity class, use get_nearby_entities with its regex filter instead of requesting an unfiltered large-radius list; for example regex='furnace' matches both furnace prototype names and the furnace entity type. If a filtered result has next_offset, inspect the next page before concluding that the target is absent.
 Do not request teleportation, item spawning, raw Lua, or other cheats.
 When the user's objective is complete or cannot be advanced with the available tools, explain the result concisely.)";
 }
@@ -36,14 +37,17 @@ AgentController::AgentController(LlamaClient llama, FactorioTools& tools)
 
 AgentRunResult AgentController::Run(
     const std::string& objective,
-    int maximumRounds,
+    std::optional<int> maximumRounds,
     std::stop_token stopToken,
     const TraceHandler& trace) const
 {
     if (objective.empty())
         throw std::runtime_error("Agent objective cannot be empty");
-    if (maximumRounds < 1 || maximumRounds > 50)
-        throw std::runtime_error("Agent maximum rounds must be between 1 and 50");
+    if (maximumRounds && (*maximumRounds < MinimumRounds || *maximumRounds > MaximumRounds))
+    {
+        throw std::runtime_error("Agent maximum rounds must be between " +
+            std::to_string(MinimumRounds) + " and " + std::to_string(MaximumRounds));
+    }
 
     json messages = json::array({
         {{"role", "system"}, {"content", SystemPrompt}},
@@ -64,7 +68,7 @@ AgentRunResult AgentController::Run(
     const auto toolDefinitions = tools_.Definitions(supportsImageInput);
 
     AgentRunResult result;
-    for (int round = 1; round <= maximumRounds; ++round)
+    for (int round = 1; !maximumRounds || round <= *maximumRounds; ++round)
     {
         if (stopToken.stop_requested())
         {
@@ -75,8 +79,9 @@ AgentRunResult AgentController::Run(
         result.rounds = round;
         if (trace)
         {
-            trace("========== AGENT ROUND " + std::to_string(round) + " OF " +
-                std::to_string(maximumRounds) + " ==========");
+            trace("========== AGENT ROUND " + std::to_string(round) +
+                (maximumRounds ? " OF " + std::to_string(*maximumRounds) : " (NON-STOP)") +
+                " ==========");
         }
         auto turn = llama_.Complete(messages, toolDefinitions, trace);
         messages.push_back(turn.assistantMessage);

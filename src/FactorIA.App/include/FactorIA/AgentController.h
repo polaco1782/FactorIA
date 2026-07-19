@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <stop_token>
 #include <string>
 
@@ -20,10 +21,13 @@ class AgentController
 public:
     using TraceHandler = LlamaClient::TraceHandler;
 
+    static constexpr int MinimumRounds = 1;
+    static constexpr int MaximumRounds = 999;
+
     AgentController(LlamaClient llama, FactorioTools& tools);
     AgentRunResult Run(
         const std::string& objective,
-        int maximumRounds,
+        std::optional<int> maximumRounds,
         std::stop_token stopToken,
         const TraceHandler& trace = {}) const;
 

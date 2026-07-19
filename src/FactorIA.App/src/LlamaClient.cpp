@@ -96,6 +96,38 @@ std::size_t JsonArraySize(const json& object, std::string_view key)
     return value != object.end() && value->is_array() ? value->size() : 0;
 }
 
+bool IsZeroPrice(const json& value)
+{
+    if (value.is_number())
+        return value.get<double>() == 0.0;
+    if (!value.is_string())
+        return false;
+
+    const auto& text = value.get_ref<const std::string&>();
+    try
+    {
+        std::size_t parsedCharacters = 0;
+        const auto price = std::stod(text, &parsedCharacters);
+        return parsedCharacters == text.size() && price == 0.0;
+    }
+    catch (const std::exception&)
+    {
+        return false;
+    }
+}
+
+bool HasFreeTextPricing(const json& model)
+{
+    const auto pricing = model.find("pricing");
+    if (pricing == model.end() || !pricing->is_object())
+        return false;
+
+    const auto prompt = pricing->find("prompt");
+    const auto completion = pricing->find("completion");
+    return prompt != pricing->end() && completion != pricing->end() &&
+        IsZeroPrice(*prompt) && IsZeroPrice(*completion);
+}
+
 void TraceModelRequest(const LlamaClient::TraceHandler& trace, const json& request)
 {
     if (trace)
@@ -181,7 +213,7 @@ void LlamaClient::CheckHealth() const
         throw std::runtime_error("llama.cpp is reachable but the model is not ready");
 }
 
-std::vector<std::string> LlamaClient::ListToolModels() const
+std::vector<std::string> LlamaClient::ListToolModels(bool freeOnly) const
 {
     if (!IsOpenRouter())
         throw std::runtime_error("The model catalog is available only for OpenRouter");
@@ -203,6 +235,8 @@ std::vector<std::string> LlamaClient::ListToolModels() const
         {
             continue;
         }
+        if (freeOnly && !HasFreeTextPricing(model))
+            continue;
 
         const auto id = model.find("id");
         if (id != model.end() && id->is_string() && !id->get_ref<const std::string&>().empty())
@@ -213,7 +247,11 @@ std::vector<std::string> LlamaClient::ListToolModels() const
     const auto duplicates = std::ranges::unique(models);
     models.erase(duplicates.begin(), duplicates.end());
     if (models.empty())
-        throw std::runtime_error("OpenRouter returned no tool-capable models for this API key");
+    {
+        throw std::runtime_error(freeOnly
+            ? "OpenRouter returned no free tool-capable models for this API key"
+            : "OpenRouter returned no tool-capable models for this API key");
+    }
     return models;
 }
 

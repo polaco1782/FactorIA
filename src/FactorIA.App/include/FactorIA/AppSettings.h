@@ -18,7 +18,10 @@ struct AppSettings
     std::string aiProvider{"llama_cpp"};
     std::string openRouterApiKey;
     std::string openRouterModel;
+    bool openRouterFreeModelsOnly{};
     std::filesystem::path factorioUserDataPath;
+    bool useDedicatedAiCharacter{};
+    bool nonStopAgentRun{};
 
     static std::filesystem::path SettingsPath();
     static AppSettings Load();

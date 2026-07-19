@@ -56,7 +56,10 @@ AppSettings AppSettings::Load()
     settings.aiProvider = value.value("ai_provider", settings.aiProvider);
     settings.openRouterApiKey = value.value("openrouter_api_key", settings.openRouterApiKey);
     settings.openRouterModel = value.value("openrouter_model", settings.openRouterModel);
+    settings.openRouterFreeModelsOnly = value.value("openrouter_free_models_only", settings.openRouterFreeModelsOnly);
     settings.factorioUserDataPath = value.value("factorio_user_data_path", settings.factorioUserDataPath.string());
+    settings.useDedicatedAiCharacter = value.value("use_dedicated_ai_character", settings.useDedicatedAiCharacter);
+    settings.nonStopAgentRun = value.value("non_stop_agent_run", settings.nonStopAgentRun);
     return settings;
 }
 
@@ -78,7 +81,10 @@ void AppSettings::Save() const
         {"ai_provider", aiProvider},
         {"openrouter_api_key", openRouterApiKey},
         {"openrouter_model", openRouterModel},
+        {"openrouter_free_models_only", openRouterFreeModelsOnly},
         {"factorio_user_data_path", factorioUserDataPath.string()},
+        {"use_dedicated_ai_character", useDedicatedAiCharacter},
+        {"non_stop_agent_run", nonStopAgentRun},
     };
     output << value.dump(2) << '\n';
 }

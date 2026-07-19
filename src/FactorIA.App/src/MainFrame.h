@@ -14,6 +14,7 @@
 #include <FactorIA/RconClient.h>
 
 class wxButton;
+class wxCheckBox;
 class wxChoice;
 class wxNotebook;
 class wxSpinCtrl;
@@ -31,6 +32,7 @@ public:
 private:
     void BuildUi();
     void UpdateAiProviderControls();
+    void UpdateAgentRoundControls();
     void LoadSettingsIntoControls();
     AppSettings ReadSettingsFromControls() const;
     void SaveSettings();
@@ -62,8 +64,10 @@ private:
     wxChoice* aiProvider_{};
     wxTextCtrl* openRouterApiKey_{};
     wxChoice* openRouterModel_{};
+    wxCheckBox* openRouterFreeModelsOnly_{};
     wxButton* fetchOpenRouterModelsButton_{};
     wxTextCtrl* factorioUserDataPath_{};
+    wxCheckBox* useDedicatedAiCharacter_{};
     wxStaticText* llamaStatus_{};
     wxButton* llamaTestButton_{};
     wxStaticText* rconStatus_{};
@@ -72,6 +76,7 @@ private:
     wxButton* testButton_{};
     wxTextCtrl* objective_{};
     wxSpinCtrl* maximumRounds_{};
+    wxCheckBox* nonStopAgentRun_{};
     wxButton* agentRunButton_{};
     wxButton* agentStopButton_{};
     wxStaticText* agentStatus_{};
