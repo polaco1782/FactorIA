@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,12 @@ struct LlamaTurn
     nlohmann::json assistantMessage;
 };
 
+struct LlamaModelCapabilities
+{
+    bool supportsImageInput{};
+    std::optional<std::size_t> contextLength;
+};
+
 class LlamaClient
 {
 public:
@@ -34,7 +41,7 @@ public:
 
     void CheckHealth() const;
     [[nodiscard]] std::vector<std::string> ListToolModels(bool freeOnly = false) const;
-    [[nodiscard]] bool SupportsImageInput() const;
+    [[nodiscard]] LlamaModelCapabilities Capabilities() const;
     LlamaTurn Complete(
         const nlohmann::json& messages,
         const nlohmann::json& tools,

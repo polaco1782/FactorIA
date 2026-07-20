@@ -1,5 +1,6 @@
 #include <FactorIA/AgentController.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <stdexcept>
 #include <string_view>
@@ -15,8 +16,24 @@ using json = nlohmann::json;
 
 constexpr int MaximumConsecutiveEmptyTurns = 3;
 constexpr int MaximumCompactionAttempts = 3;
-constexpr std::size_t ContextMessageCompactionThreshold = 48;
-constexpr std::size_t PromptTokenCompactionThreshold = 12000;
+constexpr std::size_t LocalPromptTokenCompactionThreshold = 12000;
+constexpr std::size_t MinimumReservedContextTokens = 4096;
+
+std::size_t CompactionThreshold(std::size_t contextLength)
+{
+    // Preserve at least 20% of the model context and enough room for one substantial response.
+    const auto reserve = std::max(
+        contextLength / 5,
+        std::min(MinimumReservedContextTokens, contextLength / 2));
+    return contextLength - reserve;
+}
+
+std::size_t EstimatePromptTokens(const json& messages, const json& tools)
+{
+    // Used only when the provider omits usage. Three JSON bytes per token is intentionally
+    // conservative for tool-heavy prompts and includes the repeated tool definitions.
+    return (messages.dump().size() + tools.dump().size() + 2) / 3;
+}
 
 constexpr const char* SystemPrompt = R"(You are controlling one character in Factorio through typed tools.
 Work autonomously toward the user's objective, but use only tool results as facts about the world.
@@ -69,18 +86,29 @@ AgentRunResult AgentController::Run(
         };
     }
 
-    bool supportsImageInput = false;
+    LlamaModelCapabilities modelCapabilities;
     try
     {
-        supportsImageInput = llama_.SupportsImageInput();
+        modelCapabilities = llama_.Capabilities();
     }
     catch (const std::exception& error)
     {
-        // A catalog failure should not block text-only gameplay.
+        // Catalog metadata should not block text-only gameplay.
         if (trace)
-            trace("[MODEL CAPABILITIES] Screenshot tool disabled: " + std::string(error.what()));
+            trace("[MODEL CAPABILITIES] OpenRouter metadata unavailable: " + std::string(error.what()));
     }
-    const auto toolDefinitions = tools_.Definitions(supportsImageInput);
+    const auto toolDefinitions = tools_.Definitions(modelCapabilities.supportsImageInput);
+    const auto promptTokenCompactionThreshold = modelCapabilities.contextLength
+        ? CompactionThreshold(*modelCapabilities.contextLength)
+        : LocalPromptTokenCompactionThreshold;
+    if (trace)
+    {
+        trace("[MODEL CAPABILITIES] Context limit: " +
+            (modelCapabilities.contextLength
+                ? std::to_string(*modelCapabilities.contextLength) + " tokens"
+                : std::string("unknown")) +
+            " | Compaction threshold: " + std::to_string(promptTokenCompactionThreshold) + " prompt tokens");
+    }
 
     AgentRunResult result;
     int consecutiveEmptyTurns = 0;
@@ -213,16 +241,21 @@ AgentRunResult AgentController::Run(
             });
         }
 
-        if (messages.size() >= ContextMessageCompactionThreshold ||
-            turn.promptTokens >= PromptTokenCompactionThreshold)
+        const auto estimatedPromptTokens = turn.promptTokens == 0
+            ? EstimatePromptTokens(messages, toolDefinitions)
+            : std::size_t{};
+        const auto promptTokens = turn.promptTokens == 0 ? estimatedPromptTokens : turn.promptTokens;
+        if (promptTokens >= promptTokenCompactionThreshold)
         {
             const auto previousMessageCount = messages.size();
+            const auto compactionMeasurement = turn.promptTokens == 0 ? "estimated" : "provider-reported";
             if (status)
                 status("Compacting the accumulated agent context before continuing...");
             if (trace)
             {
                 trace("[CONTEXT COMPACTION] Summarizing " + std::to_string(previousMessageCount) +
-                    " messages after a " + std::to_string(turn.promptTokens) + "-token prompt");
+                    " messages at " + std::to_string(promptTokens) + " " + compactionMeasurement +
+                    " prompt tokens; threshold " + std::to_string(promptTokenCompactionThreshold));
             }
 
             auto summaryMessages = messages;

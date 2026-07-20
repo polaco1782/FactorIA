@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -321,11 +322,11 @@ std::vector<std::string> LlamaClient::ListToolModels(bool freeOnly) const
     return models;
 }
 
-bool LlamaClient::SupportsImageInput() const
+LlamaModelCapabilities LlamaClient::Capabilities() const
 {
     // Local OpenAI-compatible servers do not expose a standard capability catalog.
     if (!IsOpenRouter())
-        return true;
+        return {.supportsImageInput = true, .contextLength = std::nullopt};
 
     const auto body = ModelCatalog();
     const auto data = body.find("data");
@@ -336,14 +337,31 @@ bool LlamaClient::SupportsImageInput() const
     {
         if (!model.is_object() || model.value("id", std::string{}) != model_)
             continue;
+
+        LlamaModelCapabilities result;
+        if (const auto contextLength = model.find("context_length");
+            contextLength != model.end() && contextLength->is_number_unsigned())
+        {
+            const auto value = contextLength->get<std::size_t>();
+            if (value > 0)
+                result.contextLength = value;
+        }
+        else if (contextLength != model.end() && contextLength->is_number_integer())
+        {
+            const auto value = contextLength->get<std::int64_t>();
+            if (value > 0)
+                result.contextLength = static_cast<std::size_t>(value);
+        }
+
         const auto architecture = model.find("architecture");
         if (architecture == model.end() || !architecture->is_object())
-            return false;
+            return result;
         const auto modalities = architecture->find("input_modalities");
-        return modalities != architecture->end() && modalities->is_array() &&
+        result.supportsImageInput = modalities != architecture->end() && modalities->is_array() &&
             std::find(modalities->begin(), modalities->end(), "image") != modalities->end();
+        return result;
     }
-    return false;
+    return {};
 }
 
 LlamaTurn LlamaClient::Complete(
