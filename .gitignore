@@ -11,3 +11,4 @@ vcpkg_installed/
 *.user
 *.VC.db
 *.VC.VC.opendb
+scripts/tabaco.zip

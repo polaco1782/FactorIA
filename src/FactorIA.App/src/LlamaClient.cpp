@@ -18,6 +18,17 @@ namespace
 using json = nlohmann::json;
 
 constexpr int MaximumCompletionAttempts = 5;
+constexpr auto ModelResponseTimeout = std::chrono::seconds(60);
+
+httplib::Client CreateCompletionConnection(const std::string& origin)
+{
+    httplib::Client client(origin);
+    client.set_connection_timeout(std::chrono::seconds(10));
+    client.set_read_timeout(ModelResponseTimeout);
+    client.set_write_timeout(std::chrono::seconds(30));
+    client.set_max_timeout(ModelResponseTimeout);
+    return client;
+}
 
 bool IsRetryableHttpStatus(int status)
 {
@@ -389,17 +400,19 @@ LlamaTurn LlamaClient::Complete(
     TraceModelRequest(trace, request);
 
     const auto action = IsOpenRouter() ? "OpenRouter completion" : "llama.cpp completion";
+    // Keep one immutable request snapshot so replacing a stalled connection cannot
+    // drop or advance the conversation state seen by the model.
     const auto requestBody = request.dump();
     std::optional<json> completedBody;
     for (int attempt = 1; attempt <= MaximumCompletionAttempts; ++attempt)
     {
-        httplib::Client client(endpoint_.origin);
-        client.set_connection_timeout(std::chrono::seconds(10));
-        client.set_read_timeout(std::chrono::minutes(5));
-        client.set_write_timeout(std::chrono::seconds(30));
+        auto client = CreateCompletionConnection(endpoint_.origin);
+        const auto requestStartedAt = std::chrono::steady_clock::now();
         const auto response = IsOpenRouter()
             ? client.Post(ChatPath(), OpenRouterHeaders(bearerToken_), requestBody, "application/json")
             : client.Post(ChatPath(), requestBody, "application/json");
+        const auto responseWait = std::chrono::steady_clock::now() - requestStartedAt;
+        const auto responseTimedOut = !response && responseWait >= ModelResponseTimeout;
 
         std::string failure;
         bool retryable = false;
@@ -434,6 +447,19 @@ LlamaTurn LlamaClient::Complete(
 
         if (!retryable || attempt == MaximumCompletionAttempts)
             throw std::runtime_error(failure);
+
+        if (responseTimedOut)
+        {
+            if (trace)
+            {
+                trace("[MODEL TIMEOUT] No response after " +
+                    std::to_string(ModelResponseTimeout.count()) +
+                    " seconds; reconnecting with the same conversation state (retry " +
+                    std::to_string(attempt) + " of " +
+                    std::to_string(MaximumCompletionAttempts - 1) + ")");
+            }
+            continue;
+        }
 
         const auto delay = std::chrono::seconds(1 << attempt);
         if (trace)

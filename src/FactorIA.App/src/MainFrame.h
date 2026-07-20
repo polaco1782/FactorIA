@@ -49,7 +49,7 @@ private:
         bool enableStop = false);
     void FinishWork();
     void SetConnectionState(bool connected, const wxString& detail = {});
-    void SetAgentActivity(const wxString& activity);
+    void AppendModelDecision(const wxString& decision);
     void AppendLog(const wxString& message);
 
     AppSettings settings_;
@@ -81,7 +81,7 @@ private:
     wxButton* agentRunButton_{};
     wxButton* agentStopButton_{};
     wxStaticText* agentStatus_{};
-    wxTextCtrl* agentActivity_{};
+    wxTextCtrl* modelDecisions_{};
     wxTextCtrl* log_{};
 };
 }

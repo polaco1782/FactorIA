@@ -1,6 +1,7 @@
 #include <FactorIA/AgentController.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <stdexcept>
 #include <string_view>
@@ -35,6 +36,39 @@ std::size_t EstimatePromptTokens(const json& messages, const json& tools)
     return (messages.dump().size() + tools.dump().size() + 2) / 3;
 }
 
+std::string SingleLine(std::string_view text)
+{
+    std::string result;
+    result.reserve(text.size());
+    bool needsSpace = false;
+    for (const auto character : text)
+    {
+        if (std::isspace(static_cast<unsigned char>(character)))
+        {
+            needsSpace = !result.empty();
+            continue;
+        }
+        if (needsSpace)
+            result.push_back(' ');
+        result.push_back(character);
+        needsSpace = false;
+    }
+    return result;
+}
+
+std::string SelectedToolsSummary(const std::vector<LlamaToolCall>& toolCalls)
+{
+    std::string summary = toolCalls.size() == 1 ? "Selected tool: " : "Selected tools: ";
+    for (std::size_t index = 0; index < toolCalls.size(); ++index)
+    {
+        if (index != 0)
+            summary += ", ";
+        summary += toolCalls[index].name;
+    }
+    summary += '.';
+    return summary;
+}
+
 constexpr const char* SystemPrompt = R"(You are controlling one character in Factorio through typed tools.
 Work autonomously toward the user's objective, but use only tool results as facts about the world.
 Treat tool definitions as the authoritative description of available actions and their arguments.
@@ -59,7 +93,7 @@ AgentRunResult AgentController::Run(
     std::optional<int> maximumRounds,
     std::stop_token stopToken,
     const TraceHandler& trace,
-    const StatusHandler& status) const
+    const DecisionHandler& decision) const
 {
     if (objective.empty())
         throw std::runtime_error("Agent objective cannot be empty");
@@ -73,18 +107,6 @@ AgentRunResult AgentController::Run(
         {{"role", "system"}, {"content", SystemPrompt}},
         {{"role", "user"}, {"content", objective}},
     });
-
-    TraceHandler modelTrace;
-    if (trace || status)
-    {
-        modelTrace = [&trace, &status](const std::string& message) {
-            if (trace)
-                trace(message);
-            constexpr std::string_view retryPrefix = "[PROVIDER RETRY] ";
-            if (status && message.starts_with(retryPrefix))
-                status(message.substr(retryPrefix.size()));
-        };
-    }
 
     LlamaModelCapabilities modelCapabilities;
     try
@@ -121,22 +143,25 @@ AgentRunResult AgentController::Run(
         }
 
         result.rounds = round;
-        if (status)
-            status("Round " + std::to_string(round) + ": waiting for the model's next decision...");
         if (trace)
         {
             trace("========== AGENT ROUND " + std::to_string(round) +
                 (maximumRounds ? " OF " + std::to_string(*maximumRounds) : " (NON-STOP)") +
                 " ==========");
         }
-        auto turn = llama_.Complete(messages, toolDefinitions, modelTrace);
+        auto turn = llama_.Complete(messages, toolDefinitions, trace);
         messages.push_back(turn.assistantMessage);
 
-        if (trace && !turn.toolCalls.empty())
+        if (!turn.toolCalls.empty())
         {
-            trace("[MODEL DECISION]\n" + (turn.content.empty()
-                ? std::string("The model did not return a visible decision summary.")
-                : turn.content));
+            const auto visibleDecision = SingleLine(turn.content);
+            const auto summary = visibleDecision.empty()
+                ? SelectedToolsSummary(turn.toolCalls)
+                : visibleDecision;
+            if (trace)
+                trace("[MODEL DECISION] " + summary);
+            if (decision)
+                decision(summary);
         }
 
         if (turn.toolCalls.empty())
@@ -157,8 +182,6 @@ AgentRunResult AgentController::Run(
                         "; requesting continuation (" + std::to_string(consecutiveEmptyTurns) + " of " +
                         std::to_string(MaximumConsecutiveEmptyTurns - 1) + ")");
                 }
-                if (status)
-                    status("The model returned no visible action or answer. Requesting another decision...");
                 messages.push_back({
                     {"role", "user"},
                     {"content", "Your previous response contained neither a tool call nor a visible final answer. "
@@ -168,8 +191,6 @@ AgentRunResult AgentController::Run(
                 continue;
             }
             result.finalText = turn.content;
-            if (status)
-                status(result.finalText);
             return result;
         }
 
@@ -187,16 +208,6 @@ AgentRunResult AgentController::Run(
             if (trace)
             {
                 trace("[TOOL CALL] " + call.name + "\nArguments:\n" + call.arguments.dump(2));
-            }
-            if (status)
-            {
-                auto activity = turn.content.empty()
-                    ? "The model selected its next action."
-                    : turn.content;
-                activity += "\n\nExecuting " + call.name;
-                if (!call.arguments.empty())
-                    activity += "\n" + call.arguments.dump(2);
-                status(activity);
             }
             json toolResult;
             try
@@ -249,8 +260,6 @@ AgentRunResult AgentController::Run(
         {
             const auto previousMessageCount = messages.size();
             const auto compactionMeasurement = turn.promptTokens == 0 ? "estimated" : "provider-reported";
-            if (status)
-                status("Compacting the accumulated agent context before continuing...");
             if (trace)
             {
                 trace("[CONTEXT COMPACTION] Summarizing " + std::to_string(previousMessageCount) +
@@ -272,7 +281,7 @@ AgentRunResult AgentController::Run(
             std::string summary;
             for (int attempt = 1; attempt <= MaximumCompactionAttempts && summary.empty(); ++attempt)
             {
-                auto summaryTurn = llama_.Complete(summaryMessages, json::array(), modelTrace);
+                auto summaryTurn = llama_.Complete(summaryMessages, json::array(), trace);
                 if (summaryTurn.toolCalls.empty())
                     summary = std::move(summaryTurn.content);
                 if (!summary.empty())
@@ -304,8 +313,6 @@ AgentRunResult AgentController::Run(
                 trace("[CONTEXT COMPACTION] Replaced " + std::to_string(previousMessageCount) +
                     " messages with " + std::to_string(messages.size()) + " compact messages");
             }
-            if (status)
-                status("Context compacted. Continuing the objective...");
         }
     }
 

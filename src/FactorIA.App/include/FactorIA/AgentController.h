@@ -21,7 +21,7 @@ class AgentController
 {
 public:
     using TraceHandler = LlamaClient::TraceHandler;
-    using StatusHandler = std::function<void(const std::string&)>;
+    using DecisionHandler = std::function<void(const std::string&)>;
 
     static constexpr int MinimumRounds = 1;
     static constexpr int MaximumRounds = 999;
@@ -32,7 +32,7 @@ public:
         std::optional<int> maximumRounds,
         std::stop_token stopToken,
         const TraceHandler& trace = {},
-        const StatusHandler& status = {}) const;
+        const DecisionHandler& decision = {}) const;
 
 private:
     LlamaClient llama_;

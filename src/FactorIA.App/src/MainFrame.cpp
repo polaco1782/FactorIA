@@ -207,10 +207,10 @@ void MainFrame::BuildUi()
     agentControls->Add(agentStopButton_, 0, wxRIGHT, 12);
     agentControls->Add(agentStatus_, 1, wxALIGN_CENTER_VERTICAL);
 
-    auto* activityBox = new wxStaticBoxSizer(wxVERTICAL, agentPanel, "Current status");
-    agentActivity_ = new wxTextCtrl(agentPanel, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize,
+    auto* activityBox = new wxStaticBoxSizer(wxVERTICAL, agentPanel, "Model decisions");
+    modelDecisions_ = new wxTextCtrl(agentPanel, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize,
         wxTE_MULTILINE | wxTE_READONLY | wxTE_RICH2);
-    activityBox->Add(agentActivity_, 1, wxEXPAND | wxALL, 8);
+    activityBox->Add(modelDecisions_, 1, wxEXPAND | wxALL, 8);
     agentRoot->Add(objectiveBox, 1, wxEXPAND | wxALL, 12);
     agentRoot->Add(agentControls, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 12);
     agentRoot->Add(activityBox, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 12);
@@ -471,7 +471,6 @@ void MainFrame::RunAgent()
         return;
     }
 
-    SetAgentActivity("Starting agent...");
     agentStatus_->SetLabel("Running");
     StartWork("Running agent objective", [this, requested, objective, maximumRounds](std::stop_token stopToken) {
         FactorioTools tools([this](const std::string& command) {
@@ -488,15 +487,11 @@ void MainFrame::RunAgent()
             [this](const std::string& trace) {
                 CallAfter([this, text = FromUtf8(trace)] { AppendLog(text); });
             },
-            [this](const std::string& status) {
-                CallAfter([this, text = FromUtf8(status)] { SetAgentActivity(text); });
+            [this](const std::string& decision) {
+                CallAfter([this, text = FromUtf8(decision)] { AppendModelDecision(text); });
             });
         CallAfter([this, result] {
             agentStatus_->SetLabel(result.stopped ? "Stopped" : "Completed");
-            if (result.stopped)
-                SetAgentActivity("Stopped.");
-            else
-                SetAgentActivity(result.finalText.empty() ? "Completed." : FromUtf8(result.finalText));
             AppendLog(result.stopped
                 ? "Agent stopped after round " + wxString::Format("%d", result.rounds)
                 : "Agent completed after round " + wxString::Format("%d", result.rounds));
@@ -510,7 +505,6 @@ void MainFrame::StopAgent()
     {
         worker_.request_stop();
         agentStatus_->SetLabel("Stopping...");
-        SetAgentActivity("Stop requested; waiting for the active operation to finish...");
         AppendLog("Stop requested; an active AI HTTP request must finish before cancellation completes");
     }
 }
@@ -546,7 +540,6 @@ void MainFrame::StartWork(
                 if (agentStatus_->GetLabel() == "Running" || agentStatus_->GetLabel() == "Stopping...")
                 {
                     agentStatus_->SetLabel("Failed");
-                    SetAgentActivity("Failed: " + message);
                 }
                 std::scoped_lock lock(clientMutex_);
                 if (!rconClient_ || !rconClient_->IsConnected())
@@ -582,10 +575,10 @@ void MainFrame::SetConnectionState(bool connected, const wxString& detail)
     agentRunButton_->Enable(connected);
 }
 
-void MainFrame::SetAgentActivity(const wxString& activity)
+void MainFrame::AppendModelDecision(const wxString& decision)
 {
-    // This view represents only the latest activity; the Log tab retains the full history.
-    agentActivity_->ChangeValue(activity);
+    // Decisions are already normalized by AgentController; keep one entry per line here.
+    modelDecisions_->AppendText(decision + "\n");
 }
 
 void MainFrame::AppendLog(const wxString& message)
