@@ -11,6 +11,7 @@ local next_job_id = 1
 
 local function ensure_storage()
     storage.path_results = storage.path_results or {}
+    storage.research_trigger_progress = storage.research_trigger_progress or {}
 end
 
 local function connected_character()
@@ -70,6 +71,124 @@ local function control_character(use_dedicated_character)
         return ensure_agent_character()
     end
     return connected_character()
+end
+
+local function trigger_progress_for(force, technology_name)
+    ensure_storage()
+    local force_progress = storage.research_trigger_progress[tostring(force.index)] or {}
+    return force_progress[technology_name] or 0
+end
+
+local function set_trigger_progress(force, technology_name, progress)
+    ensure_storage()
+    local force_key = tostring(force.index)
+    storage.research_trigger_progress[force_key] = storage.research_trigger_progress[force_key] or {}
+    storage.research_trigger_progress[force_key][technology_name] = progress
+end
+
+local function prerequisites_researched(technology)
+    for _, prerequisite in pairs(technology.prerequisites) do
+        if not prerequisite.researched then
+            return false
+        end
+    end
+    return true
+end
+
+local function quality_matches(filter, quality)
+    if not filter.quality then
+        return true
+    end
+
+    local actual = prototypes.quality[quality or "normal"]
+    local expected = prototypes.quality[filter.quality]
+    if not actual or not expected then
+        return false
+    end
+
+    local comparator = filter.comparator or "="
+    if comparator == "=" then return actual.level == expected.level end
+    if comparator == ">" then return actual.level > expected.level end
+    if comparator == "<" then return actual.level < expected.level end
+    if comparator == "≥" or comparator == ">=" then return actual.level >= expected.level end
+    if comparator == "≤" or comparator == "<=" then return actual.level <= expected.level end
+    if comparator == "≠" or comparator == "!=" then return actual.level ~= expected.level end
+    return false
+end
+
+local function id_filter_matches(filter, prototype_name, quality)
+    if type(filter) == "string" then
+        return filter == prototype_name
+    end
+    return filter and filter.name == prototype_name and quality_matches(filter, quality)
+end
+
+local function trigger_matches(trigger, action_type, prototype_name, quality)
+    if not trigger or trigger.type ~= action_type then
+        return false
+    end
+    if action_type == "craft-item" then
+        return id_filter_matches(trigger.item, prototype_name, quality)
+    end
+    if action_type == "build-entity" then
+        return id_filter_matches(trigger.entity, prototype_name, quality)
+    end
+    if action_type == "mine-entity" then
+        return trigger.entity == prototype_name
+    end
+    if action_type == "craft-fluid" then
+        return trigger.fluid == prototype_name
+    end
+    return false
+end
+
+local function trigger_required_count(trigger)
+    if trigger.type == "craft-item" then
+        return trigger.count
+    end
+    if trigger.type == "craft-fluid" then
+        return trigger.amount
+    end
+    return 1
+end
+
+local function record_research_trigger_action(
+    use_dedicated_character,
+    action_type,
+    prototype_name,
+    quality,
+    count)
+    local character = control_character(use_dedicated_character == true)
+    local force = character.force
+    local matching = {}
+    for _, technology in pairs(force.technologies) do
+        local trigger = technology.prototype.research_trigger
+        if technology.enabled and not technology.researched and prerequisites_researched(technology) and
+            trigger_matches(trigger, action_type, prototype_name, quality) then
+            matching[#matching + 1] = technology
+        end
+    end
+    table.sort(matching, function(left, right) return left.name < right.name end)
+
+    local updates = {}
+    for _, technology in ipairs(matching) do
+        local required = trigger_required_count(technology.prototype.research_trigger)
+        local progress = math.min(required, trigger_progress_for(force, technology.name) + count)
+        set_trigger_progress(force, technology.name, progress)
+        local completed = progress >= required
+        if completed then
+            -- Dedicated characters do not raise player crafting, building, or mining events, so mirror the
+            -- native trigger after the typed action has been verified by FactorIA.
+            technology.researched = true
+        end
+        updates[#updates + 1] = {
+            technology = technology.name,
+            progress = progress,
+            required = required,
+            completed = completed
+        }
+    end
+    return updates
 end
 
 local function stop_job_control(job)
@@ -183,7 +302,43 @@ remote.add_interface(interface_name, {
     runtime_info = function(action_name)
         return {
             version = runtime_version,
-            action_installed = action_name ~= nil and runtime_actions[action_name] ~= nil
+            action_installed = action_name ~= nil and runtime_actions[action_name] ~= nil,
+            research_trigger_actions = true
+        }
+    end,
+
+    record_research_trigger_action = function(
+        use_dedicated_character,
+        action_type,
+        prototype_name,
+        quality,
+        count)
+        if type(action_type) ~= "string" or type(prototype_name) ~= "string" or
+            type(count) ~= "number" or count <= 0 then
+            error("Invalid research trigger action")
+        end
+        return record_research_trigger_action(
+            use_dedicated_character,
+            action_type,
+            prototype_name,
+            quality,
+            count)
+    end,
+
+    research_trigger_progress = function(use_dedicated_character, technology_name)
+        local character = control_character(use_dedicated_character == true)
+        local technology = character.force.technologies[technology_name]
+        if not technology or not technology.prototype.research_trigger then
+            return nil
+        end
+        local required = trigger_required_count(technology.prototype.research_trigger)
+        local progress = technology.researched and required or
+            trigger_progress_for(character.force, technology.name)
+        return {
+            progress = progress,
+            required = required,
+            remaining = math.max(0, required - progress),
+            completed = technology.researched or progress >= required
         }
     end,
 

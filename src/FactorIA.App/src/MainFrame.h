@@ -1,5 +1,7 @@
 #pragma once
 
+#include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -32,6 +34,9 @@ public:
 private:
     void BuildUi();
     void UpdateAiProviderControls();
+    void UpdateOpenRouterStatusRequest();
+    void RunOpenRouterStatusUpdates(std::stop_token stopToken);
+    void SetOpenRouterStatus(std::uint64_t revision, const std::string& text);
     void UpdateAgentRoundControls();
     void LoadSettingsIntoControls();
     AppSettings ReadSettingsFromControls() const;
@@ -56,6 +61,18 @@ private:
     std::mutex clientMutex_;
     std::unique_ptr<RconClient> rconClient_;
     std::jthread worker_;
+
+    struct OpenRouterStatusRequest
+    {
+        bool enabled{};
+        std::string apiKey;
+        std::uint64_t revision{};
+    };
+
+    std::mutex openRouterStatusMutex_;
+    std::condition_variable_any openRouterStatusChanged_;
+    OpenRouterStatusRequest openRouterStatusRequest_;
+    std::jthread openRouterStatusWorker_;
 
     wxTextCtrl* rconHost_{};
     wxSpinCtrl* rconPort_{};

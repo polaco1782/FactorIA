@@ -2,6 +2,8 @@
 
 #include <chrono>
 #include <functional>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 
 #include <wx/button.h>
@@ -35,6 +37,8 @@ wxString FromPath(const std::filesystem::path& value)
 }
 
 constexpr const char* OpenRouterUrl = "https://openrouter.ai/api/v1";
+constexpr auto OpenRouterStatusDebounce = std::chrono::seconds(1);
+constexpr auto OpenRouterStatusRefreshInterval = std::chrono::minutes(1);
 
 LlamaClient CreateAiClient(const AppSettings& settings)
 {
@@ -46,6 +50,29 @@ LlamaClient CreateAiClient(const AppSettings& settings)
 std::string AiProviderName(const AppSettings& settings)
 {
     return settings.aiProvider == "openrouter" ? "OpenRouter" : "llama.cpp";
+}
+
+std::string FormatCredits(double credits)
+{
+    std::ostringstream stream;
+    stream << '$' << std::fixed << std::setprecision(6) << credits;
+    auto result = stream.str();
+    while (result.ends_with('0'))
+        result.pop_back();
+    if (result.ends_with('.'))
+        result += '0';
+    return result;
+}
+
+std::string OpenRouterStatusText(const OpenRouterKeyUsage& usage)
+{
+    auto result = "OpenRouter: " + FormatCredits(usage.usageDaily) + " today | " +
+        FormatCredits(usage.usage) + " total";
+    if (usage.limitRemaining)
+        result += " | " + FormatCredits(*usage.limitRemaining) + " key limit left";
+    else if (usage.isFreeTier)
+        result += " | free tier";
+    return result;
 }
 
 void ValidateRconSettings(const AppSettings& settings)
@@ -82,11 +109,20 @@ MainFrame::MainFrame()
     }
     LoadSettingsIntoControls();
     SetConnectionState(false);
+    openRouterStatusWorker_ = std::jthread(
+        [this](std::stop_token stopToken) { RunOpenRouterStatusUpdates(stopToken); });
+    openRouterStatusChanged_.notify_all();
     Centre();
 }
 
 MainFrame::~MainFrame()
 {
+    if (openRouterStatusWorker_.joinable())
+    {
+        openRouterStatusWorker_.request_stop();
+        openRouterStatusChanged_.notify_all();
+        openRouterStatusWorker_.join();
+    }
     if (worker_.joinable())
     {
         worker_.request_stop();
@@ -108,6 +144,11 @@ void MainFrame::BuildUi()
     auto* root = new wxBoxSizer(wxVERTICAL);
     root->Add(notebook, 1, wxEXPAND);
     SetSizer(root);
+    CreateStatusBar(2);
+    const int statusWidths[]{-1, -3};
+    SetStatusWidths(2, statusWidths);
+    SetStatusText("Factorio: Disconnected", 0);
+    SetStatusText("AI: not configured", 1);
 
     auto* connectionRoot = new wxBoxSizer(wxVERTICAL);
     auto* factorioBox = new wxStaticBoxSizer(wxVERTICAL, connectionPanel, "Factorio RCON");
@@ -229,6 +270,7 @@ void MainFrame::BuildUi()
     llamaTestButton_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { TestLlama(); });
     fetchOpenRouterModelsButton_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { FetchOpenRouterModels(); });
     aiProvider_->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { UpdateAiProviderControls(); });
+    openRouterApiKey_->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { UpdateOpenRouterStatusRequest(); });
     nonStopAgentRun_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { UpdateAgentRoundControls(); });
     agentRunButton_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { RunAgent(); });
     agentStopButton_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { StopAgent(); });
@@ -269,6 +311,93 @@ void MainFrame::UpdateAiProviderControls()
     openRouterFreeModelsOnly_->Enable(openRouter);
     fetchOpenRouterModelsButton_->Enable(openRouter);
     llamaStatus_->SetLabel("Not tested");
+    UpdateOpenRouterStatusRequest();
+}
+
+void MainFrame::UpdateOpenRouterStatusRequest()
+{
+    const auto openRouter = aiProvider_->GetSelection() == 1;
+    const auto apiKey = openRouterApiKey_->GetValue().ToStdString();
+    {
+        std::scoped_lock lock(openRouterStatusMutex_);
+        if (openRouterStatusRequest_.enabled == openRouter && openRouterStatusRequest_.apiKey == apiKey)
+            return;
+        openRouterStatusRequest_.enabled = openRouter;
+        openRouterStatusRequest_.apiKey = apiKey;
+        ++openRouterStatusRequest_.revision;
+    }
+
+    if (!openRouter)
+        SetStatusText("AI: llama.cpp", 1);
+    else if (apiKey.empty())
+        SetStatusText("OpenRouter: enter an API key to view usage", 1);
+    else
+        SetStatusText("OpenRouter: checking usage...", 1);
+    openRouterStatusChanged_.notify_all();
+}
+
+void MainFrame::RunOpenRouterStatusUpdates(std::stop_token stopToken)
+{
+    while (!stopToken.stop_requested())
+    {
+        OpenRouterStatusRequest request;
+        {
+            std::unique_lock lock(openRouterStatusMutex_);
+            openRouterStatusChanged_.wait(lock, stopToken, [this] {
+                return openRouterStatusRequest_.enabled && !openRouterStatusRequest_.apiKey.empty();
+            });
+            if (stopToken.stop_requested())
+                return;
+
+            request = openRouterStatusRequest_;
+            // Text controls emit an event for every key edit; authenticate only after the value settles.
+            const auto changed = openRouterStatusChanged_.wait_until(
+                lock,
+                stopToken,
+                std::chrono::steady_clock::now() + OpenRouterStatusDebounce,
+                [this, revision = request.revision] {
+                    return openRouterStatusRequest_.revision != revision;
+                });
+            if (stopToken.stop_requested())
+                return;
+            if (changed)
+                continue;
+        }
+
+        try
+        {
+            const auto usage = LlamaClient(OpenRouterUrl, {}, request.apiKey).GetOpenRouterKeyUsage();
+            CallAfter([this, revision = request.revision, text = OpenRouterStatusText(usage)] {
+                SetOpenRouterStatus(revision, text);
+            });
+        }
+        catch (const std::exception&)
+        {
+            CallAfter([this, revision = request.revision] {
+                SetOpenRouterStatus(revision, "OpenRouter: usage unavailable");
+            });
+        }
+
+        std::unique_lock lock(openRouterStatusMutex_);
+        openRouterStatusChanged_.wait_until(
+            lock,
+            stopToken,
+            std::chrono::steady_clock::now() + OpenRouterStatusRefreshInterval,
+            [this, revision = request.revision] {
+                return openRouterStatusRequest_.revision != revision;
+            });
+    }
+}
+
+void MainFrame::SetOpenRouterStatus(std::uint64_t revision, const std::string& text)
+{
+    {
+        std::scoped_lock lock(openRouterStatusMutex_);
+        // An HTTP response must not overwrite the state for a newer key or provider selection.
+        if (openRouterStatusRequest_.revision != revision || !openRouterStatusRequest_.enabled)
+            return;
+    }
+    SetStatusText(FromUtf8(text), 1);
 }
 
 void MainFrame::UpdateAgentRoundControls()
@@ -569,6 +698,7 @@ void MainFrame::SetConnectionState(bool connected, const wxString& detail)
 {
     const wxString state = connected ? "Connected" : "Disconnected";
     rconStatus_->SetLabel(detail.empty() ? state : state + " - " + detail);
+    SetStatusText("Factorio: " + state, 0);
     SetTitle("FactorIA - " + state);
     disconnectButton_->Enable(connected);
     testButton_->Enable(connected);

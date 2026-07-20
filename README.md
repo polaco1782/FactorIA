@@ -72,6 +72,11 @@ FactorIA uploads its trusted player-control action module over RCON in small chu
 actions on every game tick. Uploaded functions are session-local and are automatically uploaded again after a
 save load or mod reload. Only typed, validated tools are exposed to the model; model-generated Lua is never run.
 
+The bridge also records completed typed crafting, building, and mining actions for trigger-based technologies.
+This is required for the dedicated AI character because it is not attached to a `LuaPlayer` and therefore does
+not emit Factorio's normal player action events. `craft` waits for its requested batch to finish and reports the
+trigger progress or unlock directly, preventing repeated trigger-item production when one action is sufficient.
+
 Enable **Use dedicated AI character** in the Connections tab to make the bridge create and persist a separate
 blue character on the normal player force. Every observation and action then targets that character, including
 inventory, crafting, movement, mining, building, pathfinding, and screenshots. Leave the option disabled to keep

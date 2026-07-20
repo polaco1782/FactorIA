@@ -34,6 +34,11 @@ private:
     nlohmann::json StartPlayerControlAction(const nlohmann::json& arguments) const;
     nlohmann::json PollPlayerControlAction(std::uint64_t jobId) const;
     nlohmann::json StopPlayerControlAction(std::uint64_t jobId) const;
+    nlohmann::json RecordResearchTriggerAction(
+        const std::string& actionType,
+        const std::string& prototypeName,
+        const std::string& quality,
+        double count) const;
     nlohmann::json WaitForPlayerControlAction(
         const nlohmann::json& startResult,
         std::chrono::steady_clock::time_point deadline,
@@ -55,7 +60,7 @@ private:
     nlohmann::json StopWalking() const;
     nlohmann::json TakeScreenshot(const nlohmann::json& arguments, std::stop_token stopToken) const;
     nlohmann::json MineEntity(const nlohmann::json& arguments, std::stop_token stopToken) const;
-    nlohmann::json Craft(const nlohmann::json& arguments) const;
+    nlohmann::json Craft(const nlohmann::json& arguments, std::stop_token stopToken) const;
     nlohmann::json PlaceEntity(const nlohmann::json& arguments) const;
     nlohmann::json SetAssemblerRecipe(const nlohmann::json& arguments) const;
     nlohmann::json InsertItemIntoEntity(const nlohmann::json& arguments) const;

@@ -15,7 +15,7 @@ namespace
 {
 using json = nlohmann::json;
 
-constexpr int MaximumConsecutiveEmptyTurns = 3;
+constexpr int MaximumConsecutiveInvalidTerminalTurns = 3;
 constexpr int MaximumCompactionAttempts = 3;
 constexpr std::size_t LocalPromptTokenCompactionThreshold = 12000;
 constexpr std::size_t MinimumReservedContextTokens = 4096;
@@ -69,20 +69,27 @@ std::string SelectedToolsSummary(const std::vector<LlamaToolCall>& toolCalls)
     return summary;
 }
 
-constexpr const char* SystemPrompt = R"(You are controlling one character in Factorio through typed tools.
-Work autonomously toward the user's objective, but use only tool results as facts about the world.
+constexpr const char* SystemPrompt = R"(You are an autonomous Factorio player controlling one character through typed tools. Your only terminal objective is to launch a rocket.
+Interact with the game exclusively through real calls to the provided tool-calling interface.
+Until a tool result explicitly confirms that a rocket was launched, every response must contain at least one real tool call. Never return a plan, summary, explanation, table, JSON command, plain-text answer, or merely the name or description of a tool instead of invoking it. After a tool explicitly confirms the launch, stop and return only a concise final confirmation.
+After every tool result, immediately choose and invoke the next tool. Continue acting indefinitely across turns; observation, inventory inspection, planning, and intermediate milestones are never completion.
 Treat tool definitions as the authoritative description of available actions and their arguments.
-Before every tool call, briefly state the relevant observation, the chosen action, and how it advances the objective.
 Use specialized state and discovery tools before acting on unknown information. Do not guess names, coordinates, inventory contents, reachability, or crafting availability.
 Water is terrain rather than an entity or resource. Locate it with find_water, and do not infer that the map is waterless from entity searches or a limited terrain survey.
 Use exact identifiers and positions from the most recent tool results, and satisfy an action's stated preconditions before calling it.
 Before placing a distant or terrain-sensitive entity, use walk_to_for_placement with the exact same item, position, and direction, then call place_entity only when placement_ready is true.
+Advance through the smallest currently available milestone. Do not scale production for the final objective until the immediate prerequisite works.
+Perform a reported research trigger only once, then recheck it. If the same trigger remains incomplete with no changed progress, do not craft or place duplicate trigger items; invoke a genuinely different diagnostic tool.
 Take one meaningful gameplay action at a time, then inspect its result. Use batch counts when a tool supports them instead of repeating the same action one unit at a time.
 Treat partial results and reported failure conditions as new observations: adapt the next action instead of blindly retrying.
 Avoid redundant polling and broad unfiltered queries. Use filters and pagination, and prefer a tool that waits for completion when one is available.
+Prioritize survival, power, resources, automation, science, defense, and rocket production. If uncertain, call the most relevant observation tool. If an action fails, inspect the state and try another valid action.
 Factorio map X increases east and map Y increases south.
 Do not request teleportation, item spawning, raw Lua, or other cheats.
-When the user's objective is complete or cannot be advanced with the available tools, explain the result concisely.)";
+Your next response must be a tool call.)";
+
+constexpr const char* CompactionSystemPrompt = R"(You are performing an internal context-compaction task, not a Factorio gameplay turn.
+Do not call tools. Return only the requested concise plain-text progress summary so a gameplay agent can continue from it.)";
 }
 
 AgentController::AgentController(LlamaClient llama, FactorioTools& tools)
@@ -135,7 +142,8 @@ AgentRunResult AgentController::Run(
     }
 
     AgentRunResult result;
-    int consecutiveEmptyTurns = 0;
+    int consecutiveInvalidTerminalTurns = 0;
+    bool rocketLaunchConfirmed = false;
     for (int round = 1; !maximumRounds || round <= *maximumRounds; ++round)
     {
         if (stopToken.stop_requested())
@@ -168,35 +176,30 @@ AgentRunResult AgentController::Run(
 
         if (turn.toolCalls.empty())
         {
-            if (turn.content.empty())
+            ++consecutiveInvalidTerminalTurns;
+            if (consecutiveInvalidTerminalTurns >= MaximumConsecutiveInvalidTerminalTurns)
             {
-                ++consecutiveEmptyTurns;
-                if (consecutiveEmptyTurns >= MaximumConsecutiveEmptyTurns)
-                {
-                    throw std::runtime_error("AI model returned " +
-                        std::to_string(MaximumConsecutiveEmptyTurns) +
-                        " consecutive terminal responses without a tool call or final answer");
-                }
-                if (trace)
-                {
-                    trace("[MODEL RETRY] Empty terminal response" +
-                        (turn.finishReason.empty() ? std::string{} : " (finish: " + turn.finishReason + ")") +
-                        "; requesting continuation (" + std::to_string(consecutiveEmptyTurns) + " of " +
-                        std::to_string(MaximumConsecutiveEmptyTurns - 1) + ")");
-                }
-                messages.push_back({
-                    {"role", "user"},
-                    {"content", "Your previous response contained neither a tool call nor a visible final answer. "
-                        "Continue working toward the original objective. Call the next tool, or provide a concise "
-                        "final answer only if the objective is complete or genuinely cannot be advanced."},
-                });
-                continue;
+                throw std::runtime_error("AI model returned " +
+                    std::to_string(MaximumConsecutiveInvalidTerminalTurns) +
+                    " consecutive responses without the required tool call before rocket launch confirmation");
             }
-            result.finalText = turn.content;
-            return result;
+            if (trace)
+            {
+                trace("[MODEL RETRY] " + std::string(turn.content.empty() ? "Empty" : "Terminal") +
+                    " response before rocket launch confirmation" +
+                    (turn.finishReason.empty() ? std::string{} : " (finish: " + turn.finishReason + ")") +
+                    "; requiring a tool call (" + std::to_string(consecutiveInvalidTerminalTurns) + " of " +
+                    std::to_string(MaximumConsecutiveInvalidTerminalTurns - 1) + ")");
+            }
+            messages.push_back({
+                {"role", "user"},
+                {"content", "No tool result has explicitly confirmed a rocket launch. Plain-text terminal "
+                    "responses are not allowed. Invoke the next real gameplay or observation tool now."},
+            });
+            continue;
         }
 
-        consecutiveEmptyTurns = 0;
+        consecutiveInvalidTerminalTurns = 0;
 
         std::vector<std::string> imageDataUrls;
         for (const auto& call : turn.toolCalls)
@@ -235,6 +238,11 @@ AgentRunResult AgentController::Run(
             {
                 trace("[TOOL RESULT] " + call.name + "\n" + toolResult.dump(2));
             }
+            if (toolResult.value("ok", false) && toolResult["result"].is_object() &&
+                toolResult["result"].value("rocket_launch_confirmed", false))
+            {
+                rocketLaunchConfirmed = true;
+            }
             messages.push_back({
                 {"role", "tool"},
                 {"tool_call_id", call.id},
@@ -253,6 +261,11 @@ AgentRunResult AgentController::Run(
                 })},
             });
         }
+        if (rocketLaunchConfirmed)
+        {
+            result.finalText = "Rocket launch confirmed by the game state.";
+            return result;
+        }
 
         const auto estimatedPromptTokens = turn.promptTokens == 0
             ? EstimatePromptTokens(messages, toolDefinitions)
@@ -270,6 +283,7 @@ AgentRunResult AgentController::Run(
             }
 
             auto summaryMessages = messages;
+            summaryMessages.at(0)["content"] = CompactionSystemPrompt;
             summaryMessages.push_back({
                 {"role", "user"},
                 {"content", "Pause gameplay and compact the conversation for another instance of yourself. "

@@ -164,6 +164,24 @@ std::size_t JsonArraySize(const json& object, std::string_view key)
     return value != object.end() && value->is_array() ? value->size() : 0;
 }
 
+double RequiredNumber(const json& object, std::string_view key)
+{
+    const auto value = object.find(key);
+    if (value == object.end() || !value->is_number())
+        throw std::runtime_error("OpenRouter API key response has no numeric " + std::string(key));
+    return value->get<double>();
+}
+
+std::optional<double> OptionalNumber(const json& object, std::string_view key)
+{
+    const auto value = object.find(key);
+    if (value == object.end() || value->is_null())
+        return std::nullopt;
+    if (!value->is_number())
+        throw std::runtime_error("OpenRouter API key response has an invalid " + std::string(key));
+    return value->get<double>();
+}
+
 bool IsZeroPrice(const json& value)
 {
     if (value.is_number())
@@ -272,23 +290,43 @@ LlamaClient::LlamaClient(std::string baseUrl, std::string model, std::string bea
 
 void LlamaClient::CheckHealth() const
 {
-    httplib::Client client(endpoint_.origin);
-    client.set_connection_timeout(std::chrono::seconds(5));
-    client.set_read_timeout(std::chrono::seconds(10));
     if (IsOpenRouter())
     {
-        const auto response = client.Get(KeyPath(), OpenRouterHeaders(bearerToken_));
-        const auto body = ParseJsonBody(response, "OpenRouter connection test");
-        const auto key = body.find("data");
-        if (key == body.end() || !key->is_object())
-            throw std::runtime_error("OpenRouter returned an invalid API key response");
+        static_cast<void>(GetOpenRouterKeyUsage());
         return;
     }
 
+    httplib::Client client(endpoint_.origin);
+    client.set_connection_timeout(std::chrono::seconds(5));
+    client.set_read_timeout(std::chrono::seconds(10));
     const auto response = client.Get("/health");
     const auto body = ParseJsonBody(response, "llama.cpp health check");
     if (body.value("status", std::string{}) != "ok")
         throw std::runtime_error("llama.cpp is reachable but the model is not ready");
+}
+
+OpenRouterKeyUsage LlamaClient::GetOpenRouterKeyUsage() const
+{
+    if (!IsOpenRouter())
+        throw std::runtime_error("API key usage is available only for OpenRouter");
+
+    httplib::Client client(endpoint_.origin);
+    client.set_connection_timeout(std::chrono::seconds(5));
+    client.set_read_timeout(std::chrono::seconds(10));
+    const auto response = client.Get(KeyPath(), OpenRouterHeaders(bearerToken_));
+    const auto body = ParseJsonBody(response, "OpenRouter API key usage");
+    ThrowIfProviderError(body);
+    const auto key = body.find("data");
+    if (key == body.end() || !key->is_object())
+        throw std::runtime_error("OpenRouter returned an invalid API key response");
+
+    return {
+        .usage = RequiredNumber(*key, "usage"),
+        .usageDaily = RequiredNumber(*key, "usage_daily"),
+        .limit = OptionalNumber(*key, "limit"),
+        .limitRemaining = OptionalNumber(*key, "limit_remaining"),
+        .isFreeTier = key->value("is_free_tier", false),
+    };
 }
 
 std::vector<std::string> LlamaClient::ListToolModels(bool freeOnly) const

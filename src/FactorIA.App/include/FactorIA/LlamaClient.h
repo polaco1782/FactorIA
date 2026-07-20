@@ -32,6 +32,15 @@ struct LlamaModelCapabilities
     std::optional<std::size_t> contextLength;
 };
 
+struct OpenRouterKeyUsage
+{
+    double usage{};
+    double usageDaily{};
+    std::optional<double> limit;
+    std::optional<double> limitRemaining;
+    bool isFreeTier{};
+};
+
 class LlamaClient
 {
 public:
@@ -42,6 +51,7 @@ public:
     void CheckHealth() const;
     [[nodiscard]] std::vector<std::string> ListToolModels(bool freeOnly = false) const;
     [[nodiscard]] LlamaModelCapabilities Capabilities() const;
+    [[nodiscard]] OpenRouterKeyUsage GetOpenRouterKeyUsage() const;
     LlamaTurn Complete(
         const nlohmann::json& messages,
         const nlohmann::json& tools,
