@@ -13,8 +13,11 @@ The initial application shell provides:
 - local and hosted provider connection tests plus OpenAI-compatible tool-call parsing;
 - a bounded or non-stop observe/decide/execute agent loop with cancellation between calls;
 - typed game-state, inventory, craftability, nearby-entity, walking, stop, crafting, placement, machine-inventory, and container-transfer tools;
-- nearest-first spatial scans, coordinate-targeted walking, and continuous counted resource mining;
+- research discovery and queue control, assembler recipe selection, lab science-pack loading, and generic burner fuel handling;
+- nearest-first spatial scans up to 8,192 tiles, coordinate-targeted walking, and continuous counted resource mining;
 - long-range resource surveys that group ore into patch regions and provide exact walking targets;
+- generated-terrain water surveys that return nearby walkable shoreline targets;
+- build-aware positioning that pathfinds the character into reach before exact entity placement;
 - model-visible screenshots through Factorio's `script-output` directory;
 - collision-aware `walk_to` routing and tick-synchronized walking and mining through the bundled FactorIA Bridge mod;
 - optional persistent AI-owned character control, keeping the human player's character and inventory separate;

@@ -74,7 +74,9 @@ Work autonomously toward the user's objective, but use only tool results as fact
 Treat tool definitions as the authoritative description of available actions and their arguments.
 Before every tool call, briefly state the relevant observation, the chosen action, and how it advances the objective.
 Use specialized state and discovery tools before acting on unknown information. Do not guess names, coordinates, inventory contents, reachability, or crafting availability.
+Water is terrain rather than an entity or resource. Locate it with find_water, and do not infer that the map is waterless from entity searches or a limited terrain survey.
 Use exact identifiers and positions from the most recent tool results, and satisfy an action's stated preconditions before calling it.
+Before placing a distant or terrain-sensitive entity, use walk_to_for_placement with the exact same item, position, and direction, then call place_entity only when placement_ready is true.
 Take one meaningful gameplay action at a time, then inspect its result. Use batch counts when a tool supports them instead of repeating the same action one unit at a time.
 Treat partial results and reported failure conditions as new observations: adapt the next action instead of blindly retrying.
 Avoid redundant polling and broad unfiltered queries. Use filters and pagination, and prefer a tool that waits for completion when one is available.

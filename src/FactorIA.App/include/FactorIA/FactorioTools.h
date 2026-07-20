@@ -41,16 +41,23 @@ private:
     nlohmann::json GetGameState() const;
     nlohmann::json GetInventory() const;
     nlohmann::json GetCraftableRecipes() const;
+    nlohmann::json GetResearchStatus(const nlohmann::json& arguments) const;
+    nlohmann::json StartResearch(const nlohmann::json& arguments) const;
     nlohmann::json GetNearbyEntities(const nlohmann::json& arguments) const;
     nlohmann::json FindResourcePatches(const nlohmann::json& arguments) const;
+    nlohmann::json FindWater(const nlohmann::json& arguments) const;
     nlohmann::json Walk(const nlohmann::json& arguments, std::stop_token stopToken) const;
     nlohmann::json WalkTo(const nlohmann::json& arguments, std::stop_token stopToken) const;
+    nlohmann::json WalkToForPlacement(
+        const nlohmann::json& arguments,
+        std::stop_token stopToken) const;
     nlohmann::json RequestPath(double targetX, double targetY, double stoppingDistance, std::stop_token stopToken) const;
     nlohmann::json StopWalking() const;
     nlohmann::json TakeScreenshot(const nlohmann::json& arguments, std::stop_token stopToken) const;
     nlohmann::json MineEntity(const nlohmann::json& arguments, std::stop_token stopToken) const;
     nlohmann::json Craft(const nlohmann::json& arguments) const;
     nlohmann::json PlaceEntity(const nlohmann::json& arguments) const;
+    nlohmann::json SetAssemblerRecipe(const nlohmann::json& arguments) const;
     nlohmann::json InsertItemIntoEntity(const nlohmann::json& arguments) const;
     nlohmann::json TakeItemFromEntity(const nlohmann::json& arguments) const;
     nlohmann::json WaitForMachineOutput(

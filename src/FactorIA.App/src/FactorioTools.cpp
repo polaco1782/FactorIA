@@ -18,6 +18,8 @@ namespace
 {
 using json = nlohmann::json;
 
+constexpr double MaximumSearchRadius = 8192.0;
+
 json FunctionTool(std::string name, std::string description, json parameters)
 {
     return {
@@ -98,12 +100,68 @@ std::string DirectionExpression(const std::string& direction)
     throw std::runtime_error("direction must be north, east, south, or west");
 }
 
-std::string MachineInventoryExpression(const std::string& inventory)
+struct PlacementRequest
 {
-    if (inventory == "fuel") return "defines.inventory.fuel";
-    if (inventory == "input") return "defines.inventory.crafter_input";
-    if (inventory == "output") return "defines.inventory.crafter_output";
-    throw std::runtime_error("inventory must be fuel, input, or output");
+    std::string item;
+    std::string direction;
+    double x{};
+    double y{};
+};
+
+PlacementRequest RequiredPlacementRequest(const json& arguments)
+{
+    PlacementRequest request{
+        .item = RequiredPrototypeName(arguments, "item"),
+        .direction = RequiredText(arguments, "direction", 16),
+        .x = RequiredNumber(arguments, "x", -1000000.0, 1000000.0),
+        .y = RequiredNumber(arguments, "y", -1000000.0, 1000000.0),
+    };
+    static_cast<void>(DirectionExpression(request.direction));
+    return request;
+}
+
+json PlacementParameters(bool includeMaximumDuration)
+{
+    json properties{
+        {"item", {{"type", "string"}, {"minLength", 1}, {"maxLength", 128}}},
+        {"x", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
+        {"y", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
+        {"direction", {{"type", "string"}, {"enum", {"north", "east", "south", "west"}}}},
+    };
+    if (includeMaximumDuration)
+    {
+        properties["maximum_duration_seconds"] = {
+            {"type", "number"}, {"minimum", 1.0}, {"maximum", 120.0}, {"default", 60.0}};
+    }
+    return {
+        {"type", "object"},
+        {"properties", std::move(properties)},
+        {"required", {"item", "x", "y", "direction"}},
+        {"additionalProperties", false},
+    };
+}
+
+std::string EntityLookupLua(
+    const std::string& prefixLua,
+    double targetX,
+    double targetY,
+    std::string_view candidateExpression,
+    std::string_view targetDescription,
+    bool requireReach = true)
+{
+    return
+        prefixLua +
+        "local position={x=" + std::to_string(targetX) + ",y=" + std::to_string(targetY) + "} "
+        "local found=p.surface.find_entities_filtered{position=position,radius=0.75} "
+        "table.sort(found,function(a,b) local adx=a.position.x-position.x local ady=a.position.y-position.y "
+        "local bdx=b.position.x-position.x local bdy=b.position.y-position.y "
+        "return adx*adx+ady*ady<bdx*bdx+bdy*bdy end) "
+        "local target=nil for _,candidate in ipairs(found) do "
+        "if candidate~=p and (" + std::string(candidateExpression) + ") then target=candidate break end end "
+        "if not target then error('No " + std::string(targetDescription) + " found at the requested position') end "
+        + (requireReach
+            ? "if not p.can_reach_entity(target) then error('Target entity is out of reach') end "
+            : "");
 }
 
 std::string MachineLookupLua(
@@ -112,18 +170,81 @@ std::string MachineLookupLua(
     double targetY,
     bool requireReach = true)
 {
-    return
+    return EntityLookupLua(
+        controlCharacterLua,
+        targetX,
+        targetY,
+        "candidate.type=='furnace' or candidate.type=='assembling-machine'",
+        "furnace or crafting machine",
+        requireReach);
+}
+
+std::string EntityInventoryLookupLua(
+    const std::string& controlCharacterLua,
+    double targetX,
+    double targetY,
+    const std::string& inventory,
+    bool requireReach = true)
+{
+    if (inventory != "fuel" && inventory != "input" && inventory != "output")
+        throw std::runtime_error("inventory must be fuel, input, or output");
+
+    const auto inventoryLiteral = json(inventory).dump();
+    const auto prefix =
         controlCharacterLua +
-        "local position={x=" + std::to_string(targetX) + ",y=" + std::to_string(targetY) + "} "
-        "local found=p.surface.find_entities_filtered{position=position,radius=0.75,"
-        "type={'furnace','assembling-machine'}} "
-        "table.sort(found,function(a,b) local adx=a.position.x-position.x local ady=a.position.y-position.y "
-        "local bdx=b.position.x-position.x local bdy=b.position.y-position.y "
-        "return adx*adx+ady*ady<bdx*bdx+bdy*bdy end) "
-        "local target=found[1] if not target then error('No furnace or crafting machine found at the requested position') end "
-        + (requireReach
-            ? "if not p.can_reach_entity(target) then error('Target machine is out of reach') end "
-            : "");
+        "local inventory_kind=" + inventoryLiteral + " "
+        "local function factoria_inventory(entity) "
+        "if inventory_kind=='fuel' then return entity.get_fuel_inventory() end "
+        "if inventory_kind=='output' and (entity.type=='furnace' or entity.type=='assembling-machine') then "
+        "return entity.get_inventory(defines.inventory.crafter_output) end "
+        "if inventory_kind=='input' then "
+        "if entity.type=='lab' then return entity.get_inventory(defines.inventory.lab_input) end "
+        "if entity.type=='furnace' or entity.type=='assembling-machine' then "
+        "return entity.get_inventory(defines.inventory.crafter_input) end end return nil end ";
+
+    return EntityLookupLua(
+        prefix,
+        targetX,
+        targetY,
+        "factoria_inventory(candidate)~=nil",
+        "entity with a " + inventory + " inventory",
+        requireReach) +
+        "local entity_inventory=factoria_inventory(target) ";
+}
+
+std::string ResearchHelpersLua()
+{
+    return
+        "local function factoria_technology_info(technology) "
+        "local prerequisites={} local missing={} "
+        "for name,prerequisite in pairs(technology.prerequisites) do "
+        "prerequisites[#prerequisites+1]=name if not prerequisite.researched then missing[#missing+1]=name end end "
+        "table.sort(prerequisites) table.sort(missing) local ingredients={} "
+        "for _,ingredient in ipairs(technology.research_unit_ingredients) do "
+        "ingredients[#ingredients+1]={name=ingredient.name,amount=ingredient.amount} end "
+        "table.sort(ingredients,function(a,b) return a.name<b.name end) local unlocks={} "
+        "for _,effect in ipairs(technology.prototype.effects) do "
+        "if effect.type=='unlock-recipe' then unlocks[#unlocks+1]=effect.recipe end end table.sort(unlocks) "
+        "local source_trigger=technology.prototype.research_trigger local research_trigger=nil "
+        "if source_trigger then research_trigger={type=source_trigger.type} "
+        "if source_trigger.type=='craft-item' then research_trigger.item=source_trigger.item research_trigger.count=source_trigger.count "
+        "elseif source_trigger.type=='mine-entity' then research_trigger.entity=source_trigger.entity "
+        "elseif source_trigger.type=='craft-fluid' then research_trigger.fluid=source_trigger.fluid research_trigger.amount=source_trigger.amount "
+        "elseif source_trigger.type=='build-entity' then research_trigger.entity=source_trigger.entity "
+        "elseif source_trigger.type=='send-item-to-orbit' then research_trigger.item=source_trigger.item "
+        "elseif source_trigger.type=='capture-spawner' then research_trigger.entity=source_trigger.entity end end "
+        "local available=technology.enabled and not technology.researched and #missing==0 "
+        "return {name=technology.name,level=technology.level,enabled=technology.enabled,"
+        "researched=technology.researched,available=available,startable=available and research_trigger==nil,"
+        "prerequisites=prerequisites,missing_prerequisites=missing,ingredients=ingredients,"
+        "research_unit_count=technology.research_unit_count,"
+        "research_unit_energy_ticks=technology.research_unit_energy,"
+        "research_unit_time_seconds=technology.research_unit_energy/60,unlocks_recipes=unlocks,"
+        "research_mode=research_trigger and 'trigger' or 'lab',research_trigger=research_trigger} end "
+        "local function factoria_research_queue(force) local queue={} local queued={} "
+        "for index,technology in ipairs(force.research_queue) do "
+        "queue[#queue+1]={position=index,name=technology.name,level=technology.level} "
+        "queued[technology.name]=true end return queue,queued end ";
 }
 
 void RejectUnknownArguments(const json& arguments, std::initializer_list<std::string_view> allowed)
@@ -209,12 +330,33 @@ FactorioTools::FactorioTools(
             "List enabled hand-crafting recipes that the player can craft now, including the currently craftable count.",
             EmptyParameters()),
         FunctionTool(
-            "get_nearby_entities",
-            "Return a page of up to 40 nearby entities with character-relative deltas. Use regex for a case-insensitive ECMAScript search over both prototype names and entity types, for example regex='furnace' finds stone-furnace and every entity of type furnace. Exact name and type filters are also available. Distinct prototypes are returned before duplicates, and next_offset retrieves another page. Factorio X increases east and Y increases south, so a negative delta_y is north.",
+            "get_research_status",
+            "Get current and queued lab research, startable technologies, and trigger-based milestones such as crafting an item or building an entity. Results include required science packs and unlocked recipes. Optionally inspect one exact technology, including unmet prerequisites.",
             {
                 {"type", "object"},
                 {"properties", {
-                    {"radius", {{"type", "number"}, {"minimum", 1.0}, {"maximum", 128.0}}},
+                    {"technology", {{"type", "string"}, {"minLength", 1}, {"maxLength", 128}}},
+                }},
+                {"additionalProperties", false},
+            }),
+        FunctionTool(
+            "start_research",
+            "Start an available lab technology when research is idle, or append it to the force research queue. Trigger-based milestones cannot be queued; perform the reported trigger action instead. Use get_research_status first, then place a lab and insert the required science packs into its input inventory.",
+            {
+                {"type", "object"},
+                {"properties", {
+                    {"technology", {{"type", "string"}, {"minLength", 1}, {"maxLength", 128}}},
+                }},
+                {"required", {"technology"}},
+                {"additionalProperties", false},
+            }),
+        FunctionTool(
+            "get_nearby_entities",
+            "Return a page of up to 40 nearby entities with character-relative deltas. Use regex for a case-insensitive ECMAScript search over both prototype names and entity types, for example regex='furnace' finds stone-furnace and every entity of type furnace. Exact name and type filters are also available. Distinct prototypes are returned before duplicates, and next_offset retrieves another page. This tool cannot find terrain tiles such as water; use find_water for water. Factorio X increases east and Y increases south, so a negative delta_y is north.",
+            {
+                {"type", "object"},
+                {"properties", {
+                    {"radius", {{"type", "number"}, {"minimum", 1.0}, {"maximum", MaximumSearchRadius}}},
                     {"name", {{"type", "string"}, {"minLength", 1}, {"maxLength", 128}}},
                     {"type", {{"type", "string"}, {"minLength", 1}, {"maxLength", 128}}},
                     {"regex", {{"type", "string"}, {"minLength", 1}, {"maxLength", 128}}},
@@ -225,14 +367,25 @@ FactorioTools::FactorioTools(
             }),
         FunctionTool(
             "find_resource_patches",
-            "Survey a large generated area for resource entities and return the nearest grouped patch regions with exact walking targets. Use resource='iron-ore', 'copper-ore', 'coal', 'stone', 'uranium-ore', or 'any'. Prefer this over wandering when locating ore.",
+            "Survey a large generated area for resource entities and return the nearest grouped patch regions with exact walking targets. Use resource='iron-ore', 'copper-ore', 'coal', 'stone', 'uranium-ore', or 'any'. Water is a terrain tile, not a resource; use find_water for water. Prefer this over wandering when locating ore.",
             {
                 {"type", "object"},
                 {"properties", {
                     {"resource", {{"type", "string"}, {"minLength", 1}, {"maxLength", 128}}},
-                    {"radius", {{"type", "number"}, {"minimum", 32.0}, {"maximum", 2048.0}}},
+                    {"radius", {{"type", "number"}, {"minimum", 32.0}, {"maximum", MaximumSearchRadius}}},
                 }},
                 {"required", {"resource", "radius"}},
+                {"additionalProperties", false},
+            }),
+        FunctionTool(
+            "find_water",
+            "Survey generated terrain for pumpable water tiles and return the nearest shoreline positions with exact walk targets. Use this before planning steam power or placing an offshore pump. Water is not an entity or resource, so do not search for it with get_nearby_entities or find_resource_patches. A result with found=false covers only generated terrain within the requested radius and does not prove that the whole map is waterless.",
+            {
+                {"type", "object"},
+                {"properties", {
+                    {"radius", {{"type", "number"}, {"minimum", 32.0}, {"maximum", MaximumSearchRadius}}},
+                }},
+                {"required", {"radius"}},
                 {"additionalProperties", false},
             }),
         FunctionTool(
@@ -261,6 +414,10 @@ FactorioTools::FactorioTools(
                 {"required", {"x", "y"}},
                 {"additionalProperties", false},
             }),
+        FunctionTool(
+            "walk_to_for_placement",
+            "Validate an exact future place_entity request, find a pathable stand position within the character's real build reach, and walk there without consuming the item. Call this with the same item, x, y, and direction before placing terrain-sensitive or distant entities. It returns placement_ready and the exact next place_entity arguments; if the build coordinate or direction is invalid, it reports that after positioning instead of repeatedly guessing.",
+            PlacementParameters(true)),
         FunctionTool(
             "stop_walking",
             "Stop the controlled character walking immediately.",
@@ -304,21 +461,24 @@ FactorioTools::FactorioTools(
             }),
         FunctionTool(
             "place_entity",
-            "Place one buildable item from the controlled character's inventory on a reachable open tile using normal Factorio build rules. The item is consumed only when placement succeeds.",
+            "Place one buildable item from the controlled character's inventory on a reachable open tile using normal Factorio build rules. The item is consumed only when placement succeeds. Use walk_to_for_placement first when the exact target is distant or place_entity reports out_of_build_reach.",
+            PlacementParameters(false)),
+        FunctionTool(
+            "set_assembler_recipe",
+            "Set the enabled recipe on a reachable assembling machine, chemical plant, or oil refinery. Any ingredients ejected by changing recipes are returned to the character or safely spilled beside the machine if the inventory is full.",
             {
                 {"type", "object"},
                 {"properties", {
-                    {"item", {{"type", "string"}, {"minLength", 1}, {"maxLength", 128}}},
                     {"x", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
                     {"y", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
-                    {"direction", {{"type", "string"}, {"enum", {"north", "east", "south", "west"}}}},
+                    {"recipe", {{"type", "string"}, {"minLength", 1}, {"maxLength", 128}}},
                 }},
-                {"required", {"item", "x", "y", "direction"}},
+                {"required", {"x", "y", "recipe"}},
                 {"additionalProperties", false},
             }),
         FunctionTool(
             "insert_item_into_entity",
-            "Move a specified item count from the controlled character into a reachable furnace or crafting machine. Use inventory='fuel' for fuel and inventory='input' for ingredients such as ore.",
+            "Move items from the controlled character into a reachable production entity. Use inventory='input' for furnace or assembler ingredients and lab science packs. Use inventory='fuel' for any burner entity, including furnaces, mining drills, boilers, and burner inserters.",
             {
                 {"type", "object"},
                 {"properties", {
@@ -333,7 +493,7 @@ FactorioTools::FactorioTools(
             }),
         FunctionTool(
             "take_item_from_entity",
-            "Move a specified item count from a reachable furnace or crafting machine into the controlled character's inventory. Use inventory='output' to collect smelted plates.",
+            "Move items from a reachable production entity into the controlled character's inventory. Supports lab or crafting input, burner fuel, and output from furnaces or assemblers. Mining drills emit onto the ground or transport belts rather than exposing a retrievable output inventory.",
             {
                 {"type", "object"},
                 {"properties", {
@@ -411,6 +571,16 @@ json FactorioTools::Execute(const std::string& name, const json& arguments, std:
         RejectUnknownArguments(arguments, {});
         return GetCraftableRecipes();
     }
+    if (name == "get_research_status")
+    {
+        RejectUnknownArguments(arguments, {"technology"});
+        return GetResearchStatus(arguments);
+    }
+    if (name == "start_research")
+    {
+        RejectUnknownArguments(arguments, {"technology"});
+        return StartResearch(arguments);
+    }
     if (name == "get_nearby_entities")
     {
         RejectUnknownArguments(arguments, {"radius", "name", "type", "regex", "offset"});
@@ -421,6 +591,11 @@ json FactorioTools::Execute(const std::string& name, const json& arguments, std:
         RejectUnknownArguments(arguments, {"resource", "radius"});
         return FindResourcePatches(arguments);
     }
+    if (name == "find_water")
+    {
+        RejectUnknownArguments(arguments, {"radius"});
+        return FindWater(arguments);
+    }
     if (name == "walk")
     {
         RejectUnknownArguments(arguments, {"direction", "duration_seconds"});
@@ -430,6 +605,11 @@ json FactorioTools::Execute(const std::string& name, const json& arguments, std:
     {
         RejectUnknownArguments(arguments, {"x", "y", "stopping_distance", "maximum_duration_seconds"});
         return WalkTo(arguments, stopToken);
+    }
+    if (name == "walk_to_for_placement")
+    {
+        RejectUnknownArguments(arguments, {"item", "x", "y", "direction", "maximum_duration_seconds"});
+        return WalkToForPlacement(arguments, stopToken);
     }
     if (name == "stop_walking")
     {
@@ -455,6 +635,11 @@ json FactorioTools::Execute(const std::string& name, const json& arguments, std:
     {
         RejectUnknownArguments(arguments, {"item", "x", "y", "direction"});
         return PlaceEntity(arguments);
+    }
+    if (name == "set_assembler_recipe")
+    {
+        RejectUnknownArguments(arguments, {"x", "y", "recipe"});
+        return SetAssemblerRecipe(arguments);
     }
     if (name == "insert_item_into_entity")
     {
@@ -635,9 +820,66 @@ json FactorioTools::GetCraftableRecipes() const
         "return {recipes=recipes,total_count=total,truncated=total>#recipes}");
 }
 
+json FactorioTools::GetResearchStatus(const json& arguments) const
+{
+    const auto requestedTechnology = arguments.contains("technology")
+        ? RequiredPrototypeName(arguments, "technology")
+        : std::string{};
+
+    return ExecuteJson(
+        ControlCharacterLua() + ResearchHelpersLua() +
+        "local force=p.force local queue,queued=factoria_research_queue(force) "
+        + (requestedTechnology.empty()
+            ? std::string(
+                "local available={} local triggered={} for _,technology in pairs(force.technologies) do "
+                "local info=factoria_technology_info(technology) "
+                "if info.startable and not queued[technology.name] then available[#available+1]=info "
+                "elseif info.available and info.research_trigger then triggered[#triggered+1]=info end end "
+                "table.sort(available,function(a,b) return a.name<b.name end) "
+                "table.sort(triggered,function(a,b) return a.name<b.name end) local total=#available "
+                "while #available>80 do table.remove(available) end "
+                "local trigger_total=#triggered while #triggered>80 do table.remove(triggered) end "
+                "local current=force.current_research and factoria_technology_info(force.current_research) or nil "
+                "if current then current.progress=force.research_progress end "
+                "return {research_enabled=force.research_enabled,current=current,queue=queue,"
+                "available=available,total_available=total,truncated=total>#available,"
+                "triggered_milestones=triggered,total_triggered_milestones=trigger_total,"
+                "triggered_milestones_truncated=trigger_total>#triggered}")
+            : "local technology=force.technologies[" + LuaStringLiteral(requestedTechnology) + "] "
+                "if not technology then error('Unknown technology: " + requestedTechnology + "') end "
+                "local info=factoria_technology_info(technology) info.queued=queued[technology.name] or false "
+                "if force.current_research==technology then info.progress=force.research_progress end "
+                "return {research_enabled=force.research_enabled,technology=info,queue=queue}"));
+}
+
+json FactorioTools::StartResearch(const json& arguments) const
+{
+    const auto technologyName = RequiredPrototypeName(arguments, "technology");
+    return ExecuteJson(
+        ControlCharacterLua() + ResearchHelpersLua() +
+        "local force=p.force if not force.research_enabled then error('Research is disabled for this force') end "
+        "local technology=force.technologies[" + LuaStringLiteral(technologyName) + "] "
+        "if not technology then error('Unknown technology: " + technologyName + "') end "
+        "local info=factoria_technology_info(technology) local queue,queued=factoria_research_queue(force) "
+        "if technology.researched then return {accepted=false,reason='already_researched',technology=info,queue=queue} end "
+        "if not technology.enabled then return {accepted=false,reason='technology_disabled',technology=info,queue=queue} end "
+        "if #info.missing_prerequisites>0 then "
+        "return {accepted=false,reason='missing_prerequisites',technology=info,queue=queue} end "
+        "if info.research_trigger then "
+        "return {accepted=false,reason='trigger_action_required',technology=info,queue=queue} end "
+        "local already_queued=queued[technology.name] or false "
+        "if not already_queued then local updated={} for _,entry in ipairs(force.research_queue) do "
+        "updated[#updated+1]=entry end updated[#updated+1]=technology force.research_queue=updated end "
+        "queue,queued=factoria_research_queue(force) local accepted=queued[technology.name] or false "
+        "local current=force.current_research and force.current_research.name or nil "
+        "return {accepted=accepted,already_queued=already_queued,technology=info,"
+        "current_research=current,research_progress=force.research_progress,queue=queue,"
+        "reason=accepted and (already_queued and 'already_queued' or 'queued') or 'rejected_by_factorio'}");
+}
+
 json FactorioTools::GetNearbyEntities(const json& arguments) const
 {
-    const auto radius = RequiredNumber(arguments, "radius", 1.0, 128.0);
+    const auto radius = RequiredNumber(arguments, "radius", 1.0, MaximumSearchRadius);
     auto nameFilter = arguments.contains("name")
         ? " filter.name=\"" + RequiredPrototypeName(arguments, "name") + "\" "
         : std::string{};
@@ -710,7 +952,10 @@ json FactorioTools::GetNearbyEntities(const json& arguments) const
         "local function summarize(inv,limit) if not inv then return nil end local items={} "
         "for _,item in pairs(inv.get_contents()) do items[#items+1]={name=item.name,count=item.count} end "
         "table.sort(items,function(a,b) return a.count>b.count end) "
-        "while #items>limit do table.remove(items) end if #items==0 then return nil end return items end "
+        "while #items>limit do table.remove(items) end return items end "
+        "local function attach_inventory(info,name,inv,limit) if not inv then return end "
+        "info.inventory=info.inventory or {} info.inventory[name]={items=summarize(inv,limit),"
+        "empty=inv.is_empty(),full=inv.is_full()} end "
         "local filter={position=p.position,radius=" + std::to_string(radius) + "} " +
         nameFilter + typeFilter +
         "local found=p.surface.find_entities_filtered(filter) "
@@ -730,15 +975,17 @@ json FactorioTools::GetNearbyEntities(const json& arguments) const
         "position={x=e.position.x,y=e.position.y},delta={x=dx,y=dy},"
         "distance=math.sqrt(dx*dx+dy*dy),direction=e.direction,health=e.health,"
         "minable=e.minable,reachable=p.can_reach_entity(e),prototype_count_in_radius=counts[e.name]} "
+        "if e.status then for name,value in pairs(defines.entity_status) do "
+        "if value==e.status then info.status=name break end end end "
         "if e.type=='resource' then info.amount=e.amount "
         "elseif e.type=='container' or e.type=='logistic-container' then "
-        "info.inventory={items=summarize(e.get_inventory(defines.inventory.chest),6)} "
-        "elseif e.type=='furnace' then info.crafting=e.is_crafting() "
-        "if info.crafting then info.wait_tool='wait_for_machine_output' end info.inventory={"
-        "fuel=summarize(e.get_inventory(defines.inventory.fuel),4),"
-        "input=summarize(e.get_inventory(defines.inventory.crafter_input),4),"
-        "output=summarize(e.get_inventory(defines.inventory.crafter_output),4)} "
-        "elseif e.type=='assembling-machine' then info.crafting=e.is_crafting() "
+        "attach_inventory(info,'chest',e.get_inventory(defines.inventory.chest),6) end "
+        "local fuel=e.get_fuel_inventory() attach_inventory(info,'fuel',fuel,4) "
+        "if e.type=='lab' then attach_inventory(info,'input',e.get_inventory(defines.inventory.lab_input),6) "
+        "elseif e.type=='furnace' or e.type=='assembling-machine' then "
+        "attach_inventory(info,'input',e.get_inventory(defines.inventory.crafter_input),6) "
+        "attach_inventory(info,'output',e.get_inventory(defines.inventory.crafter_output),4) "
+        "info.crafting=e.is_crafting() local recipe=e.get_recipe() info.recipe=recipe and recipe.name or nil "
         "if info.crafting then info.wait_tool='wait_for_machine_output' end end "
         "entities[#entities+1]=info end "
         "return {radius=" + std::to_string(radius) + ",player_position={x=p.position.x,y=p.position.y},"
@@ -752,7 +999,7 @@ json FactorioTools::GetNearbyEntities(const json& arguments) const
 json FactorioTools::FindResourcePatches(const json& arguments) const
 {
     const auto resource = RequiredPrototypeName(arguments, "resource");
-    const auto radius = RequiredNumber(arguments, "radius", 32.0, 2048.0);
+    const auto radius = RequiredNumber(arguments, "radius", 32.0, MaximumSearchRadius);
     const auto nameFilter = resource == "any"
         ? std::string{}
         : " filter.name=\"" + resource + "\" ";
@@ -784,6 +1031,64 @@ json FactorioTools::FindResourcePatches(const json& arguments) const
         "return {requested_resource=\"" + resource + "\",radius=" + std::to_string(radius) +
         ",player_position={x=p.position.x,y=p.position.y},coordinate_hint='positive x is east; positive y is south',"
         "grouping='32-tile survey cells; adjacent results can belong to one physical patch',patches=patches} ");
+}
+
+json FactorioTools::FindWater(const json& arguments) const
+{
+    const auto radius = RequiredNumber(arguments, "radius", 32.0, MaximumSearchRadius);
+    return ExecuteJson(
+        ControlCharacterLua() +
+        "local radius=" + std::to_string(radius) + " local water_names={} "
+        "for name,prototype in pairs(prototypes.tile) do "
+        "if prototype.fluid and prototype.fluid.name=='water' then water_names[#water_names+1]=name end end "
+        "table.sort(water_names) "
+        "local base={radius=radius,player_position={x=p.position.x,y=p.position.y},"
+        "coordinate_hint='positive x is east; positive y is south',terrain_scope='generated terrain only',"
+        "water_tile_prototypes=water_names} "
+        "if #water_names==0 then base.found=false base.reason='No tile prototype produces water for an offshore pump' "
+        "return base end "
+        "local function contains_water(search_radius) "
+        "return p.surface.count_tiles_filtered{position=p.position,radius=search_radius,name=water_names,limit=1}>0 end "
+        "local lower=0 local upper=math.min(32,radius) "
+        "while upper<radius and not contains_water(upper) do lower=upper upper=math.min(radius,upper*2) end "
+        "if not contains_water(upper) then base.found=false "
+        "base.reason='No water was found in generated terrain within the requested radius; explore or search a larger radius' "
+        "return base end "
+        "for _=1,14 do if upper-lower<=0.25 then break end local middle=(lower+upper)/2 "
+        "if contains_water(middle) then upper=middle else lower=middle end end "
+        "local tiles=p.surface.find_tiles_filtered{position=p.position,radius=math.min(radius,upper+2),"
+        "name=water_names,limit=256} "
+        "table.sort(tiles,function(a,b) local adx=a.position.x+0.5-p.position.x "
+        "local ady=a.position.y+0.5-p.position.y local bdx=b.position.x+0.5-p.position.x "
+        "local bdy=b.position.y+0.5-p.position.y return adx*adx+ady*ady<bdx*bdx+bdy*bdy end) "
+        "local offsets={{x=0,y=-1,direction='north'},{x=1,y=0,direction='east'},"
+        "{x=0,y=1,direction='south'},{x=-1,y=0,direction='west'}} "
+        "local pump_directions={{name='north',value=defines.direction.north},"
+        "{name='east',value=defines.direction.east},{name='south',value=defines.direction.south},"
+        "{name='west',value=defines.direction.west}} "
+        "local shorelines={} local seen={} "
+        "for _,tile in ipairs(tiles) do if #shorelines>=16 then break end "
+        "local water={x=tile.position.x+0.5,y=tile.position.y+0.5} "
+        "for _,offset in ipairs(offsets) do local land={x=water.x+offset.x,y=water.y+offset.y} "
+        "local land_tile=p.surface.get_tile(land) "
+        "if not land_tile.prototype.fluid and not land_tile.collides_with('player') then "
+        "local key=land.x..':'..land.y if not seen[key] then seen[key]=true "
+        "local walk=p.surface.find_non_colliding_position(p.name,land,0.49,0.1) "
+        "if walk then local dx=walk.x-p.position.x local dy=walk.y-p.position.y "
+        "local shoreline={water_tile=tile.name,fluid=tile.prototype.fluid.name,"
+        "water_position=water,shore_position={x=land.x,y=land.y},walk_position={x=walk.x,y=walk.y},"
+        "water_from_shore=({north='south',east='west',south='north',west='east'})[offset.direction],"
+        "distance=math.sqrt(dx*dx+dy*dy)} "
+        "if prototypes.entity['offshore-pump'] then for _,pump_direction in ipairs(pump_directions) do "
+        "if p.surface.can_place_entity{name='offshore-pump',position=land,direction=pump_direction.value,"
+        "force=p.force,build_check_type=defines.build_check_type.manual} then "
+        "shoreline.offshore_pump_placement={item='offshore-pump',x=land.x,y=land.y,"
+        "direction=pump_direction.name} break end end end "
+        "shorelines[#shorelines+1]=shoreline end end end end end "
+        "table.sort(shorelines,function(a,b) return a.distance<b.distance end) "
+        "base.found=#tiles>0 base.nearest_water_distance=upper base.shorelines=shorelines "
+        "if #shorelines==0 then base.reason='Water was found, but no adjacent walkable shoreline was found in the nearest sample' end "
+        "return base");
 }
 
 json FactorioTools::Walk(const json& arguments, std::stop_token stopToken) const
@@ -896,6 +1201,131 @@ json FactorioTools::WalkTo(const json& arguments, std::stop_token stopToken) con
     return result;
 }
 
+json FactorioTools::WalkToForPlacement(const json& arguments, std::stop_token stopToken) const
+{
+    const auto request = RequiredPlacementRequest(arguments);
+    const auto direction = DirectionExpression(request.direction);
+    const auto maximumSeconds = NumberOrDefault(
+        arguments,
+        "maximum_duration_seconds",
+        60.0,
+        1.0,
+        120.0);
+
+    auto plan = ExecuteJson(
+        ControlCharacterLua() +
+        "local item_name=" + LuaStringLiteral(request.item) + " local item=prototypes.item[item_name] "
+        "if not item then error('Unknown item prototype: ' .. item_name) end "
+        "local place_result=item.place_result "
+        "if not place_result then error('Item cannot be placed as an entity: ' .. item_name) end "
+        "local requested={x=" + std::to_string(request.x) + ",y=" + std::to_string(request.y) + "} "
+        "local direction=" + direction + " local build={name=place_result.name,position=requested,direction=direction} "
+        "local inventory=p.get_main_inventory() local result={item=item_name,entity_name=place_result.name,"
+        "requested_position=requested,requested_direction=" + LuaStringLiteral(request.direction) + ","
+        "current_position={x=p.position.x,y=p.position.y},build_distance=p.build_distance,"
+        "item_count=inventory and inventory.get_item_count(item_name) or 0,"
+        "target_valid_before_move=p.surface.can_place_entity{name=place_result.name,position=requested,"
+        "direction=direction,force=p.force,build_check_type=defines.build_check_type.manual},"
+        "placement_ready=p.can_place_entity(build)} "
+        "if result.placement_ready then result.candidates={} return result end "
+        "local box=place_result.collision_box "
+        "local extent=math.max(math.abs(box.left_top.x),math.abs(box.left_top.y),"
+        "math.abs(box.right_bottom.x),math.abs(box.right_bottom.y)) "
+        "local inner=extent+1.25 local outer=extent+math.max(2,math.min(4,p.build_distance-0.5)) "
+        "if outer<inner then outer=inner end local candidates={} local seen={} "
+        "for ring=inner,outer,0.75 do for index=0,15 do local angle=index*math.pi/8 "
+        "local anchor={x=requested.x+math.cos(angle)*ring,y=requested.y+math.sin(angle)*ring} "
+        "local candidate=p.surface.find_non_colliding_position(p.name,anchor,0.7,0.2) "
+        "if candidate then local key=math.floor(candidate.x*4+0.5)..':'..math.floor(candidate.y*4+0.5) "
+        "local tx=candidate.x-requested.x local ty=candidate.y-requested.y "
+        "local edge_distance=math.max(0,math.sqrt(tx*tx+ty*ty)-extent) "
+        "if not seen[key] and edge_distance<=p.build_distance-0.25 then seen[key]=true "
+        "local px=candidate.x-p.position.x local py=candidate.y-p.position.y "
+        "candidates[#candidates+1]={x=candidate.x,y=candidate.y,"
+        "distance_from_player=math.sqrt(px*px+py*py),edge_distance=edge_distance} end end end end "
+        "table.sort(candidates,function(a,b) return a.distance_from_player<b.distance_from_player end) "
+        "while #candidates>24 do table.remove(candidates) end result.candidates=candidates return result");
+
+    const json nextArguments{
+        {"item", request.item},
+        {"x", request.x},
+        {"y", request.y},
+        {"direction", request.direction},
+    };
+    plan["next_tool"] = {{"name", "place_entity"}, {"arguments", nextArguments}};
+    auto candidates = plan.value("candidates", json::array());
+    plan.erase("candidates");
+    if (plan.value("placement_ready", false))
+    {
+        plan["reached_build_position"] = true;
+        plan["reason"] = "already_ready_for_place_entity";
+        return plan;
+    }
+    if (candidates.empty())
+    {
+        plan["reached_build_position"] = false;
+        plan["reason"] = "no_collision_free_build_position";
+        return plan;
+    }
+
+    const auto deadline = DeadlineAfter(maximumSeconds);
+    for (const auto& candidate : candidates)
+    {
+        if (stopToken.stop_requested())
+        {
+            plan["stopped"] = true;
+            plan["reached_build_position"] = false;
+            return plan;
+        }
+        const auto remaining = std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count();
+        if (remaining < 1.0)
+            break;
+
+        auto movement = WalkTo({
+            {"x", candidate.at("x")},
+            {"y", candidate.at("y")},
+            {"stopping_distance", 0.5},
+            {"maximum_duration_seconds", std::min(remaining, 120.0)},
+        }, stopToken);
+        plan["movement"] = movement;
+        if (!movement.value("reached", false))
+            continue;
+
+        const auto verification = ExecuteJson(
+            ControlCharacterLua() +
+            "local item=prototypes.item[" + LuaStringLiteral(request.item) + "] "
+            "local place_result=item and item.place_result "
+            "if not place_result then error('Placement item is no longer available') end "
+            "local requested={x=" + std::to_string(request.x) + ",y=" + std::to_string(request.y) + "} "
+            "local direction=" + direction + " "
+            "return {current_position={x=p.position.x,y=p.position.y},build_distance=p.build_distance,"
+            "target_valid=p.surface.can_place_entity{name=place_result.name,position=requested,"
+            "direction=direction,force=p.force,build_check_type=defines.build_check_type.manual},"
+            "placement_ready=p.can_place_entity{name=place_result.name,position=requested,direction=direction}}");
+        plan["current_position"] = verification.at("current_position");
+        plan["build_distance"] = verification.at("build_distance");
+        plan["target_valid"] = verification.at("target_valid");
+        plan["placement_ready"] = verification.at("placement_ready");
+        plan["approach_position"] = {{"x", candidate.at("x")}, {"y", candidate.at("y")}};
+        plan["reached_build_position"] = verification.value("placement_ready", false);
+        if (verification.value("placement_ready", false))
+        {
+            plan["reason"] = "ready_for_place_entity";
+            return plan;
+        }
+        if (!verification.value("target_valid", false))
+        {
+            plan["reason"] = "invalid_build_target_or_direction";
+            return plan;
+        }
+    }
+
+    plan["placement_ready"] = false;
+    plan["reached_build_position"] = false;
+    plan["reason"] = "no_pathable_position_within_build_reach";
+    return plan;
+}
+
 json FactorioTools::StopWalking() const
 {
     return ExecuteJson(
@@ -1003,35 +1433,66 @@ json FactorioTools::Craft(const json& arguments) const
 
 json FactorioTools::PlaceEntity(const json& arguments) const
 {
-    const auto item = RequiredPrototypeName(arguments, "item");
-    const auto targetX = RequiredNumber(arguments, "x", -1000000.0, 1000000.0);
-    const auto targetY = RequiredNumber(arguments, "y", -1000000.0, 1000000.0);
-    const auto directionValue = arguments.find("direction");
-    if (directionValue == arguments.end() || !directionValue->is_string())
-        throw std::runtime_error("Missing string argument: direction");
-    const auto direction = DirectionExpression(directionValue->get<std::string>());
+    const auto request = RequiredPlacementRequest(arguments);
+    const auto direction = DirectionExpression(request.direction);
 
     return ExecuteJson(
         ControlCharacterLua() +
         "local inv=p.get_main_inventory() if not inv then error('Controlled character has no main inventory') end "
-        "local item_name=\"" + item + "\" local source=inv.find_item_stack(item_name) "
-        "if not source then error('Player does not have item: " + item + "') end "
+        "local item_name=" + LuaStringLiteral(request.item) + " local source=inv.find_item_stack(item_name) "
+        "if not source then error('Player does not have item: " + request.item + "') end "
         "local place_result=source.prototype.place_result "
-        "if not place_result then error('Item cannot be placed as an entity: " + item + "') end "
-        "local requested={x=" + std::to_string(targetX) + ",y=" + std::to_string(targetY) + "} "
+        "if not place_result then error('Item cannot be placed as an entity: " + request.item + "') end "
+        "local requested={x=" + std::to_string(request.x) + ",y=" + std::to_string(request.y) + "} "
+        "local target_valid=p.surface.can_place_entity{name=place_result.name,position=requested,"
+        "direction=" + direction + ",force=p.force,build_check_type=defines.build_check_type.manual} "
         "local accepted=p.can_place_entity{name=place_result.name,position=requested,direction=" + direction + "} "
         "local entity=nil if accepted then local quality=source.quality.name "
         "local removed=inv.remove{name=item_name,count=1,quality=quality} "
         "if removed==1 then entity=p.surface.create_entity{name=place_result.name,position=requested,"
         "direction=" + direction + ",force=p.force,quality=quality,raise_built=true} "
         "if not entity then inv.insert{name=item_name,count=1,quality=quality} end end end "
-        "local placed=entity~=nil local result={placed=placed,build_accepted=accepted,item=\"" + item + "\",requested_position=requested,"
-        "remaining_item_count=inv.get_item_count(\"" + item + "\")} "
+        "local placed=entity~=nil local result={placed=placed,build_accepted=accepted,target_valid=target_valid,"
+        "item=item_name,requested_position=requested,requested_direction=" + LuaStringLiteral(request.direction) + ","
+        "player_position={x=p.position.x,y=p.position.y},build_distance=p.build_distance,"
+        "remaining_item_count=inv.get_item_count(item_name)} "
         "if entity then result.entity={name=entity.name,position={x=entity.position.x,y=entity.position.y},"
         "direction=entity.direction,unit_number=entity.unit_number} end "
-        "if not accepted then result.reason='Factorio build rules rejected this position; choose another open tile within reach' "
+        "if not accepted and target_valid then result.reason='out_of_build_reach'; result.suggested_tool='walk_to_for_placement' "
+        "elseif not accepted then result.reason='invalid_build_target_or_direction' "
         "elseif not placed then result.reason='Factorio accepted the build but the placed entity could not be verified' end "
         "return result");
+}
+
+json FactorioTools::SetAssemblerRecipe(const json& arguments) const
+{
+    const auto targetX = RequiredNumber(arguments, "x", -1000000.0, 1000000.0);
+    const auto targetY = RequiredNumber(arguments, "y", -1000000.0, 1000000.0);
+    const auto recipeName = RequiredPrototypeName(arguments, "recipe");
+
+    return ExecuteJson(
+        EntityLookupLua(
+            ControlCharacterLua(),
+            targetX,
+            targetY,
+            "candidate.type=='assembling-machine'",
+            "assembling machine",
+            true) +
+        "local recipe_name=" + LuaStringLiteral(recipeName) + " local recipe=p.force.recipes[recipe_name] "
+        "if not recipe then error('Unknown recipe: ' .. recipe_name) end "
+        "if not recipe.enabled then error('Recipe is not enabled: ' .. recipe_name) end "
+        "local previous=target.get_recipe() local removed=target.set_recipe(recipe_name) "
+        "local destination=p.get_main_inventory() local returned={} local spilled={} "
+        "for _,item in ipairs(removed) do local inserted=destination and destination.insert(item) or 0 "
+        "if inserted>0 then returned[#returned+1]={name=item.name,quality=item.quality,count=inserted} end "
+        "local remainder=item.count-inserted if remainder>0 then "
+        "target.surface.spill_item_stack{position=target.position,"
+        "stack={name=item.name,quality=item.quality,count=remainder},enable_looted=true,force=p.force} "
+        "spilled[#spilled+1]={name=item.name,quality=item.quality,count=remainder} end end "
+        "local selected=target.get_recipe() return {entity={name=target.name,type=target.type,"
+        "position={x=target.position.x,y=target.position.y}},previous_recipe=previous and previous.name or nil,"
+        "recipe=selected and selected.name or nil,recipe_set=selected~=nil and selected.name==recipe_name,"
+        "returned_to_player=returned,spilled_beside_machine=spilled}");
 }
 
 json FactorioTools::InsertItemIntoEntity(const json& arguments) const
@@ -1045,15 +1506,13 @@ json FactorioTools::InsertItemIntoEntity(const json& arguments) const
         throw std::runtime_error("Missing string argument: inventory");
     const auto inventory = inventoryValue->get<std::string>();
     if (inventory == "output")
-        throw std::runtime_error("Cannot insert items into a machine output inventory");
-    const auto inventoryExpression = MachineInventoryExpression(inventory);
+        throw std::runtime_error("Cannot insert items into an entity output inventory");
 
     return ExecuteJson(
-        MachineLookupLua(ControlCharacterLua(), targetX, targetY) +
+        EntityInventoryLookupLua(ControlCharacterLua(), targetX, targetY, inventory) +
         "local source=p.get_main_inventory() if not source then error('Controlled character has no main inventory') end "
         "local item_name=\"" + item + "\" if not prototypes.item[item_name] then error('Unknown item prototype: ' .. item_name) end "
-        "local destination=target.get_inventory(" + inventoryExpression + ") "
-        "if not destination then error('Target machine has no " + inventory + " inventory') end "
+        "local destination=entity_inventory "
         "local available=source.get_item_count(item_name) if available==0 then error('Player does not have item: ' .. item_name) end "
         "local requested=math.min(" + std::to_string(count) + ",available,destination.get_insertable_count(item_name)) "
         "local removed=0 local inserted=0 if requested>0 then "
@@ -1076,14 +1535,12 @@ json FactorioTools::TakeItemFromEntity(const json& arguments) const
     if (inventoryValue == arguments.end() || !inventoryValue->is_string())
         throw std::runtime_error("Missing string argument: inventory");
     const auto inventory = inventoryValue->get<std::string>();
-    const auto inventoryExpression = MachineInventoryExpression(inventory);
 
     return ExecuteJson(
-        MachineLookupLua(ControlCharacterLua(), targetX, targetY) +
+        EntityInventoryLookupLua(ControlCharacterLua(), targetX, targetY, inventory) +
         "local destination=p.get_main_inventory() if not destination then error('Controlled character has no main inventory') end "
         "local item_name=\"" + item + "\" if not prototypes.item[item_name] then error('Unknown item prototype: ' .. item_name) end "
-        "local source=target.get_inventory(" + inventoryExpression + ") "
-        "if not source then error('Target machine has no " + inventory + " inventory') end "
+        "local source=entity_inventory "
         "local available=source.get_item_count(item_name) "
         "local requested=math.min(" + std::to_string(count) + ",available,destination.get_insertable_count(item_name)) "
         "local removed=0 local inserted=0 if requested>0 then "
