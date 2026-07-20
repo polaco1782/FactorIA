@@ -207,13 +207,13 @@ void MainFrame::BuildUi()
     agentControls->Add(agentStopButton_, 0, wxRIGHT, 12);
     agentControls->Add(agentStatus_, 1, wxALIGN_CENTER_VERTICAL);
 
-    auto* outputBox = new wxStaticBoxSizer(wxVERTICAL, agentPanel, "Final response");
-    agentOutput_ = new wxTextCtrl(agentPanel, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize,
+    auto* activityBox = new wxStaticBoxSizer(wxVERTICAL, agentPanel, "Current status");
+    agentActivity_ = new wxTextCtrl(agentPanel, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize,
         wxTE_MULTILINE | wxTE_READONLY | wxTE_RICH2);
-    outputBox->Add(agentOutput_, 1, wxEXPAND | wxALL, 8);
+    activityBox->Add(agentActivity_, 1, wxEXPAND | wxALL, 8);
     agentRoot->Add(objectiveBox, 1, wxEXPAND | wxALL, 12);
     agentRoot->Add(agentControls, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 12);
-    agentRoot->Add(outputBox, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 12);
+    agentRoot->Add(activityBox, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 12);
     agentPanel->SetSizer(agentRoot);
 
     auto* logRoot = new wxBoxSizer(wxVERTICAL);
@@ -471,7 +471,7 @@ void MainFrame::RunAgent()
         return;
     }
 
-    agentOutput_->Clear();
+    SetAgentActivity("Starting agent...");
     agentStatus_->SetLabel("Running");
     StartWork("Running agent objective", [this, requested, objective, maximumRounds](std::stop_token stopToken) {
         FactorioTools tools([this](const std::string& command) {
@@ -481,12 +481,22 @@ void MainFrame::RunAgent()
             return rconClient_->Execute(command);
         }, requested.factorioUserDataPath, requested.useDedicatedAiCharacter);
         AgentController controller(CreateAiClient(requested), tools);
-        const auto result = controller.Run(objective, maximumRounds, stopToken, [this](const std::string& trace) {
-            CallAfter([this, text = FromUtf8(trace)] { AppendLog(text); });
-        });
+        const auto result = controller.Run(
+            objective,
+            maximumRounds,
+            stopToken,
+            [this](const std::string& trace) {
+                CallAfter([this, text = FromUtf8(trace)] { AppendLog(text); });
+            },
+            [this](const std::string& status) {
+                CallAfter([this, text = FromUtf8(status)] { SetAgentActivity(text); });
+            });
         CallAfter([this, result] {
             agentStatus_->SetLabel(result.stopped ? "Stopped" : "Completed");
-            agentOutput_->SetValue(FromUtf8(result.finalText));
+            if (result.stopped)
+                SetAgentActivity("Stopped.");
+            else
+                SetAgentActivity(result.finalText.empty() ? "Completed." : FromUtf8(result.finalText));
             AppendLog(result.stopped
                 ? "Agent stopped after round " + wxString::Format("%d", result.rounds)
                 : "Agent completed after round " + wxString::Format("%d", result.rounds));
@@ -500,6 +510,7 @@ void MainFrame::StopAgent()
     {
         worker_.request_stop();
         agentStatus_->SetLabel("Stopping...");
+        SetAgentActivity("Stop requested; waiting for the active operation to finish...");
         AppendLog("Stop requested; an active AI HTTP request must finish before cancellation completes");
     }
 }
@@ -533,7 +544,10 @@ void MainFrame::StartWork(
                 if (llamaStatus_->GetLabel() == "Testing...")
                     llamaStatus_->SetLabel("Failed");
                 if (agentStatus_->GetLabel() == "Running" || agentStatus_->GetLabel() == "Stopping...")
+                {
                     agentStatus_->SetLabel("Failed");
+                    SetAgentActivity("Failed: " + message);
+                }
                 std::scoped_lock lock(clientMutex_);
                 if (!rconClient_ || !rconClient_->IsConnected())
                     SetConnectionState(false, "Connection failed");
@@ -566,6 +580,12 @@ void MainFrame::SetConnectionState(bool connected, const wxString& detail)
     disconnectButton_->Enable(connected);
     testButton_->Enable(connected);
     agentRunButton_->Enable(connected);
+}
+
+void MainFrame::SetAgentActivity(const wxString& activity)
+{
+    // This view represents only the latest activity; the Log tab retains the full history.
+    agentActivity_->ChangeValue(activity);
 }
 
 void MainFrame::AppendLog(const wxString& message)

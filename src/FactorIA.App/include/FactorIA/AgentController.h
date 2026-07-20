@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <stop_token>
 #include <string>
@@ -20,6 +21,7 @@ class AgentController
 {
 public:
     using TraceHandler = LlamaClient::TraceHandler;
+    using StatusHandler = std::function<void(const std::string&)>;
 
     static constexpr int MinimumRounds = 1;
     static constexpr int MaximumRounds = 999;
@@ -29,7 +31,8 @@ public:
         const std::string& objective,
         std::optional<int> maximumRounds,
         std::stop_token stopToken,
-        const TraceHandler& trace = {}) const;
+        const TraceHandler& trace = {},
+        const StatusHandler& status = {}) const;
 
 private:
     LlamaClient llama_;

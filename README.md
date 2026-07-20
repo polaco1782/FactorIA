@@ -36,6 +36,24 @@ Example Factorio arguments:
 factorio.exe --rcon-port 27015 --rcon-password mypassword
 ```
 
+### Headless Linux server
+
+Use the bundled launcher to run a local headless server without pausing when no
+human player is connected:
+
+```bash
+./scripts/start-factorio-server.sh ~/.factorio/saves/my-save.zip
+```
+
+The launcher uses a separate write-data directory under
+`~/.local/state/factoria/factorio-server` by default. This keeps the server's
+`.lock`, logs, autosaves, and mod state separate from `~/.factorio`, allowing a
+graphical Factorio client on the same machine to start and connect normally.
+Set `FACTORIO_SERVER_ROOT` or `FACTORIO_EXECUTABLE` to override the default
+locations. The RCON listener defaults to `127.0.0.1:27015`; the launcher asks
+for its password without echoing it. Set `FACTORIO_RCON_PASSWORD` when starting
+the server non-interactively through a service manager.
+
 Settings are stored in the platform-specific user configuration directory under `FactorIA/settings.json`.
 
 ## FactorIA Bridge mod

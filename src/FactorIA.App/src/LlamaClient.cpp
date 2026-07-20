@@ -1,9 +1,12 @@
 #include <FactorIA/LlamaClient.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 
 #include <httplib.h>
 
@@ -12,6 +15,59 @@ namespace factoria
 namespace
 {
 using json = nlohmann::json;
+
+constexpr int MaximumCompletionAttempts = 5;
+
+bool IsRetryableHttpStatus(int status)
+{
+    return status == 408 || status == 409 || status == 425 || status == 429 || status >= 500;
+}
+
+std::string Lowercase(std::string text)
+{
+    std::ranges::transform(text, text.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return text;
+}
+
+bool IsRetryableProviderError(const json& body)
+{
+    const auto error = body.find("error");
+    if (error == body.end() || !error->is_object())
+        return false;
+
+    if (const auto code = error->find("code"); code != error->end() && code->is_number_integer() &&
+        IsRetryableHttpStatus(code->get<int>()))
+    {
+        return true;
+    }
+
+    const auto message = Lowercase(error->value("message", std::string{}));
+    constexpr std::string_view transientMarkers[]{
+        "resourceexhausted",
+        "resource exhausted",
+        "rate limit",
+        "request limit",
+        "temporarily unavailable",
+        "timeout",
+        "timed out",
+        "overloaded",
+        "upstream error",
+    };
+    return std::ranges::any_of(transientMarkers, [&message](std::string_view marker) {
+        return message.find(marker) != std::string::npos;
+    });
+}
+
+std::string ProviderError(const json& body)
+{
+    const auto error = body.find("error");
+    return "AI provider error: " +
+        (error != body.end() && error->is_object()
+            ? error->value("message", "unknown error")
+            : std::string("unknown error"));
+}
 
 std::string HttpFailure(const std::string& action, const httplib::Result& response)
 {
@@ -176,6 +232,16 @@ void TraceModelResponse(const LlamaClient::TraceHandler& trace, const json& body
         const auto content = message->find("content");
         if (content != message->end() && content->is_string() && !content->get_ref<const std::string&>().empty())
             summary += "\nAssistant:\n" + content->get<std::string>();
+        else
+        {
+            const auto reasoning = message->find("reasoning");
+            const auto reasoningDetails = message->find("reasoning_details");
+            const auto hasReasoning =
+                (reasoning != message->end() && !reasoning->is_null() && !reasoning->empty()) ||
+                (reasoningDetails != message->end() && !reasoningDetails->is_null() && !reasoningDetails->empty());
+            summary += "\nAssistant: <empty> | Reasoning payload: " +
+                std::string(hasReasoning ? "present" : "absent");
+        }
     }
 
     if (const auto error = body.find("error"); error != body.end() && error->is_object())
@@ -304,16 +370,65 @@ LlamaTurn LlamaClient::Complete(
     }
     TraceModelRequest(trace, request);
 
-    httplib::Client client(endpoint_.origin);
-    client.set_connection_timeout(std::chrono::seconds(10));
-    client.set_read_timeout(std::chrono::minutes(5));
-    client.set_write_timeout(std::chrono::seconds(30));
-    const auto response = IsOpenRouter()
-        ? client.Post(ChatPath(), OpenRouterHeaders(bearerToken_), request.dump(), "application/json")
-        : client.Post(ChatPath(), request.dump(), "application/json");
-    const auto body = ParseJsonBody(response, IsOpenRouter() ? "OpenRouter completion" : "llama.cpp completion");
-    TraceModelResponse(trace, body);
-    ThrowIfProviderError(body);
+    const auto action = IsOpenRouter() ? "OpenRouter completion" : "llama.cpp completion";
+    const auto requestBody = request.dump();
+    std::optional<json> completedBody;
+    for (int attempt = 1; attempt <= MaximumCompletionAttempts; ++attempt)
+    {
+        httplib::Client client(endpoint_.origin);
+        client.set_connection_timeout(std::chrono::seconds(10));
+        client.set_read_timeout(std::chrono::minutes(5));
+        client.set_write_timeout(std::chrono::seconds(30));
+        const auto response = IsOpenRouter()
+            ? client.Post(ChatPath(), OpenRouterHeaders(bearerToken_), requestBody, "application/json")
+            : client.Post(ChatPath(), requestBody, "application/json");
+
+        std::string failure;
+        bool retryable = false;
+        if (!response || response->status < 200 || response->status >= 300)
+        {
+            failure = HttpFailure(action, response);
+            retryable = !response || IsRetryableHttpStatus(response->status);
+        }
+        else
+        {
+            try
+            {
+                auto body = ParseJsonBody(response, action);
+                TraceModelResponse(trace, body);
+                if (const auto error = body.find("error"); error != body.end() && error->is_object())
+                {
+                    failure = ProviderError(body);
+                    retryable = IsRetryableProviderError(body);
+                }
+                else
+                {
+                    completedBody = std::move(body);
+                    break;
+                }
+            }
+            catch (const std::runtime_error& error)
+            {
+                failure = error.what();
+                retryable = true;
+            }
+        }
+
+        if (!retryable || attempt == MaximumCompletionAttempts)
+            throw std::runtime_error(failure);
+
+        const auto delay = std::chrono::seconds(1 << attempt);
+        if (trace)
+        {
+            trace("[PROVIDER RETRY] " + failure + "\nRetry " + std::to_string(attempt) + " of " +
+                std::to_string(MaximumCompletionAttempts - 1) + " in " +
+                std::to_string(delay.count()) + " seconds");
+        }
+        std::this_thread::sleep_for(delay);
+    }
+    if (!completedBody)
+        throw std::runtime_error("AI completion failed without a provider response");
+    const auto& body = *completedBody;
 
     const auto choices = body.find("choices");
     if (choices == body.end() || !choices->is_array() || choices->empty())
@@ -323,6 +438,9 @@ LlamaTurn LlamaClient::Complete(
         throw std::runtime_error("AI completion did not contain an assistant message");
 
     LlamaTurn turn;
+    turn.finishReason = choices->front().value("finish_reason", std::string{});
+    if (const auto usage = body.find("usage"); usage != body.end() && usage->is_object())
+        turn.promptTokens = usage->value("prompt_tokens", std::size_t{});
     turn.assistantMessage = *messageIt;
     turn.assistantMessage["role"] = "assistant";
     if (const auto content = messageIt->find("content"); content != messageIt->end() && content->is_string())

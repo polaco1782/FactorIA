@@ -46,6 +46,18 @@ double RequiredNumber(const json& arguments, const std::string& name, double min
     return number;
 }
 
+double NumberOrDefault(
+    const json& arguments,
+    const std::string& name,
+    double defaultValue,
+    double minimum,
+    double maximum)
+{
+    return arguments.contains(name)
+        ? RequiredNumber(arguments, name, minimum, maximum)
+        : defaultValue;
+}
+
 int RequiredInteger(const json& arguments, const std::string& name, int minimum, int maximum)
 {
     const auto value = arguments.find(name);
@@ -237,16 +249,16 @@ FactorioTools::FactorioTools(
             }),
         FunctionTool(
             "walk_to",
-            "Walk toward map coordinates using normal eight-direction player movement. Factorio X increases east and Y increases south. Stops near the target or reports an obstruction/timeout.",
+            "Walk toward map coordinates using normal eight-direction player movement. Factorio X increases east and Y increases south. Stops near the target or reports an obstruction/timeout. stopping_distance defaults to 1.5 and maximum_duration_seconds defaults to 60.",
             {
                 {"type", "object"},
                 {"properties", {
                     {"x", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
                     {"y", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
-                    {"stopping_distance", {{"type", "number"}, {"minimum", 0.5}, {"maximum", 10.0}}},
-                    {"maximum_duration_seconds", {{"type", "number"}, {"minimum", 1.0}, {"maximum", 30.0}}},
+                    {"stopping_distance", {{"type", "number"}, {"minimum", 0.5}, {"maximum", 10.0}, {"default", 1.5}}},
+                    {"maximum_duration_seconds", {{"type", "number"}, {"minimum", 1.0}, {"maximum", 120.0}, {"default", 60.0}}},
                 }},
-                {"required", {"x", "y", "stopping_distance", "maximum_duration_seconds"}},
+                {"required", {"x", "y"}},
                 {"additionalProperties", false},
             }),
         FunctionTool(
@@ -268,16 +280,14 @@ FactorioTools::FactorioTools(
             }),
         FunctionTool(
             "mine_entity",
-            "Continuously mine the entity at exact map coordinates using normal player mining. For resource nodes, count is the number of resource units to extract. Coordinates identify only one tree, rock, or other discrete entity, so their effective count is automatically one. The player must first be within reach.",
+            "Continuously mine the nearest reachable entity with the exact prototype name using normal player mining. For resources, count is the total number of units to extract across adjacent nodes. Trees, rocks, and other discrete entities are mined once. Walk near the target first; the tool resolves the exact entity position and chooses a sufficient timeout.",
             {
                 {"type", "object"},
                 {"properties", {
-                    {"x", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
-                    {"y", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
+                    {"name", {{"type", "string"}, {"minLength", 1}, {"maxLength", 128}}},
                     {"count", {{"type", "integer"}, {"minimum", 1}, {"maximum", 200}}},
-                    {"maximum_duration_seconds", {{"type", "number"}, {"minimum", 1.0}, {"maximum", 120.0}}},
                 }},
-                {"required", {"x", "y", "count", "maximum_duration_seconds"}},
+                {"required", {"name", "count"}},
                 {"additionalProperties", false},
             }),
         FunctionTool(
@@ -433,7 +443,7 @@ json FactorioTools::Execute(const std::string& name, const json& arguments, std:
     }
     if (name == "mine_entity")
     {
-        RejectUnknownArguments(arguments, {"x", "y", "count", "maximum_duration_seconds"});
+        RejectUnknownArguments(arguments, {"name", "count"});
         return MineEntity(arguments, stopToken);
     }
     if (name == "craft")
@@ -840,8 +850,8 @@ json FactorioTools::WalkTo(const json& arguments, std::stop_token stopToken) con
 {
     const auto targetX = RequiredNumber(arguments, "x", -1000000.0, 1000000.0);
     const auto targetY = RequiredNumber(arguments, "y", -1000000.0, 1000000.0);
-    const auto stoppingDistance = RequiredNumber(arguments, "stopping_distance", 0.5, 10.0);
-    const auto maximumSeconds = RequiredNumber(arguments, "maximum_duration_seconds", 1.0, 30.0);
+    const auto stoppingDistance = NumberOrDefault(arguments, "stopping_distance", 1.5, 0.5, 10.0);
+    const auto maximumSeconds = NumberOrDefault(arguments, "maximum_duration_seconds", 60.0, 1.0, 120.0);
     EnsurePlayerControlAction();
     const auto pathResult = RequestPath(targetX, targetY, stoppingDistance, stopToken);
     const auto pathfinderAvailable = pathResult.value("available", false);
@@ -961,13 +971,12 @@ json FactorioTools::TakeScreenshot(const json& arguments, std::stop_token stopTo
 
 json FactorioTools::MineEntity(const json& arguments, std::stop_token stopToken) const
 {
-    const auto targetX = RequiredNumber(arguments, "x", -1000000.0, 1000000.0);
-    const auto targetY = RequiredNumber(arguments, "y", -1000000.0, 1000000.0);
+    const auto targetName = RequiredPrototypeName(arguments, "name");
     const auto count = RequiredInteger(arguments, "count", 1, 200);
-    const auto maximumSeconds = RequiredNumber(arguments, "maximum_duration_seconds", 1.0, 120.0);
+    const auto maximumSeconds = std::max(10.0, static_cast<double>(count) * 2.5 + 5.0);
     const auto start = StartPlayerControlAction({
         {"kind", "mine"},
-        {"target", {{"x", targetX}, {"y", targetY}}},
+        {"name", targetName},
         {"count", count},
         {"maximum_duration_seconds", maximumSeconds},
     });
@@ -977,6 +986,7 @@ json FactorioTools::MineEntity(const json& arguments, std::stop_token stopToken)
         stopToken);
     if (result.value("mined", false))
         result["inventory"] = GetInventory();
+    result["maximum_duration_seconds"] = maximumSeconds;
     result["mining_control"] = "factorio_bridge_runtime";
     return result;
 }

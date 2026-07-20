@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <functional>
 #include <string>
 #include <vector>
@@ -18,6 +19,8 @@ struct LlamaToolCall
 struct LlamaTurn
 {
     std::string content;
+    std::string finishReason;
+    std::size_t promptTokens{};
     std::vector<LlamaToolCall> toolCalls;
     nlohmann::json assistantMessage;
 };
