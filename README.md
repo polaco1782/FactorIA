@@ -14,10 +14,12 @@ The initial application shell provides:
 - a bounded or non-stop observe/decide/execute agent loop with cancellation between calls;
 - typed game-state, inventory, craftability, nearby-entity, walking, stop, crafting, placement, machine-inventory, and container-transfer tools;
 - research discovery and queue control, assembler recipe selection, lab science-pack loading, and generic burner fuel handling;
+- blueprint-ghost and deconstruction-mark discovery plus bounded, normal-movement tools that service those explicit player requests;
 - nearest-first spatial scans up to 8,192 tiles, coordinate-targeted walking, and continuous counted resource mining;
 - long-range resource surveys that group ore into patch regions and provide exact walking targets;
 - generated-terrain water surveys that return nearby walkable shoreline targets;
 - build-aware positioning that pathfinds the character into reach before exact entity placement;
+- Factorio-validated placement planning and verification for item, belt, fluid, electric, heat, and wall connections;
 - model-visible screenshots through Factorio's `script-output` directory;
 - collision-aware `walk_to` routing and tick-synchronized walking and mining through the bundled FactorIA Bridge mod;
 - optional persistent AI-owned character control, keeping the human player's character and inventory separate;
@@ -82,6 +84,24 @@ blue character on the normal player force. Every observation and action then tar
 inventory, crafting, movement, mining, building, pathfinding, and screenshots. Leave the option disabled to keep
 controlling the first connected player's character. The dedicated character starts with an empty inventory and
 must gather its own resources.
+
+### In-game agent commands
+
+The bridge mod provides one namespaced console command for inspecting and recovering the dedicated character:
+
+```text
+/factoria-agent status
+/factoria-agent spawn
+/factoria-agent come
+/factoria-agent goto
+/factoria-agent remove
+```
+
+`status` is available to every player and does not spawn the character as a side effect. The other operations
+require administrator permission when invoked by a player. `come` moves the agent beside the invoking player and
+stops active bridge runtime jobs first; `goto` moves the invoking player beside the agent. `remove` spills the
+agent's inventories at its position before removing it. The desktop agent can start another action after `come`
+or `remove`, so stop the run in FactorIA first when performing manual recovery.
 
 ## Screenshot tool
 

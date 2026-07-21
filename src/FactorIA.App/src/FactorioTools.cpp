@@ -20,6 +20,14 @@ using json = nlohmann::json;
 
 constexpr double MaximumSearchRadius = 8192.0;
 
+bool HasArgumentValue(const json& arguments, const std::string& name)
+{
+    const auto value = arguments.find(name);
+    if (value == arguments.end() || value->is_null())
+        return false;
+    return !value->is_string() || !value->get_ref<const std::string&>().empty();
+}
+
 json FunctionTool(std::string name, std::string description, json parameters)
 {
     return {
@@ -44,7 +52,11 @@ double RequiredNumber(const json& arguments, const std::string& name, double min
         throw std::runtime_error("Missing numeric argument: " + name);
     const auto number = value->get<double>();
     if (!std::isfinite(number) || number < minimum || number > maximum)
-        throw std::runtime_error("Argument " + name + " is outside the allowed range");
+    {
+        throw std::runtime_error(
+            "Argument " + name + " must be between " + std::to_string(minimum) +
+            " and " + std::to_string(maximum));
+    }
     return number;
 }
 
@@ -55,7 +67,7 @@ double NumberOrDefault(
     double minimum,
     double maximum)
 {
-    return arguments.contains(name)
+    return HasArgumentValue(arguments, name)
         ? RequiredNumber(arguments, name, minimum, maximum)
         : defaultValue;
 }
@@ -67,8 +79,34 @@ int RequiredInteger(const json& arguments, const std::string& name, int minimum,
         throw std::runtime_error("Missing integer argument: " + name);
     const auto number = value->get<int>();
     if (number < minimum || number > maximum)
-        throw std::runtime_error("Argument " + name + " is outside the allowed range");
+    {
+        throw std::runtime_error(
+            "Argument " + name + " must be between " + std::to_string(minimum) +
+            " and " + std::to_string(maximum));
+    }
     return number;
+}
+
+int IntegerOrDefault(
+    const json& arguments,
+    const std::string& name,
+    int defaultValue,
+    int minimum,
+    int maximum)
+{
+    return HasArgumentValue(arguments, name)
+        ? RequiredInteger(arguments, name, minimum, maximum)
+        : defaultValue;
+}
+
+bool BooleanOrDefault(const json& arguments, const std::string& name, bool defaultValue)
+{
+    if (!HasArgumentValue(arguments, name))
+        return defaultValue;
+    const auto value = arguments.find(name);
+    if (!value->is_boolean())
+        throw std::runtime_error("Argument " + name + " must be a boolean");
+    return value->get<bool>();
 }
 
 std::string RequiredText(const json& arguments, const std::string& name, std::size_t maximumLength)
@@ -78,7 +116,11 @@ std::string RequiredText(const json& arguments, const std::string& name, std::si
         throw std::runtime_error("Missing string argument: " + name);
     const auto text = value->get<std::string>();
     if (text.empty() || text.size() > maximumLength)
-        throw std::runtime_error("Argument " + name + " is outside the allowed length range");
+    {
+        throw std::runtime_error(
+            "Argument " + name + " must contain between 1 and " +
+            std::to_string(maximumLength) + " characters");
+    }
     return text;
 }
 
@@ -89,6 +131,13 @@ std::string RequiredPrototypeName(const json& arguments, const std::string& name
     if (!std::regex_match(text, allowed))
         throw std::runtime_error("Argument " + name + " is not a valid Factorio prototype name");
     return text;
+}
+
+std::string PrototypeNameOrEmpty(const json& arguments, const std::string& name)
+{
+    return HasArgumentValue(arguments, name)
+        ? RequiredPrototypeName(arguments, name)
+        : std::string{};
 }
 
 std::string DirectionExpression(const std::string& direction)
@@ -138,6 +187,36 @@ json PlacementParameters(bool includeMaximumDuration)
         {"properties", std::move(properties)},
         {"required", {"item", "x", "y", "direction"}},
         {"additionalProperties", false},
+    };
+}
+
+json ConstructionBatchParameters()
+{
+    return {
+        {"type", "object"},
+        {"properties", {
+            {"radius", {{"type", "number"}, {"minimum", 1.0}, {"maximum", MaximumSearchRadius}}},
+            {"count", {{"type", "integer"}, {"minimum", 1}, {"maximum", 20}}},
+            {"maximum_duration_seconds", {{"type", "number"}, {"minimum", 1.0}, {"maximum", 600.0}}},
+        }},
+        {"required", {"radius", "count", "maximum_duration_seconds"}},
+        {"additionalProperties", false},
+    };
+}
+
+struct ConstructionBatchRequest
+{
+    double radius{};
+    int count{};
+    double maximumSeconds{};
+};
+
+ConstructionBatchRequest RequiredConstructionBatch(const json& arguments)
+{
+    return {
+        .radius = RequiredNumber(arguments, "radius", 1.0, MaximumSearchRadius),
+        .count = RequiredInteger(arguments, "count", 1, 20),
+        .maximumSeconds = RequiredNumber(arguments, "maximum_duration_seconds", 1.0, 600.0),
     };
 }
 
@@ -253,7 +332,7 @@ std::string ResearchHelpersLua(bool useDedicatedCharacter)
         "queued[technology.name]=true end return queue,queued end ";
 }
 
-std::string EntityFluidDetailsLua()
+std::string EntityConnectionDetailsLua()
 {
     return
         "local function factoria_direction_name(direction) "
@@ -262,6 +341,41 @@ std::string EntityFluidDetailsLua()
         "[defines.direction.south]='south',[defines.direction.southwest]='southwest',"
         "[defines.direction.west]='west',[defines.direction.northwest]='northwest'} "
         "return names[direction] or tostring(direction) end "
+        "local function factoria_entity_reference(entity) "
+        "if not entity or not entity.valid then return nil end "
+        "return {name=entity.name,type=entity.type,position={x=entity.position.x,y=entity.position.y},"
+        "direction=factoria_direction_name(entity.direction),unit_number=entity.unit_number} end "
+        "local function factoria_optional_property(entity,name) "
+        "local ok,value=pcall(function() return entity[name] end) if ok then return value end return nil end "
+        "local function factoria_entity_references(entities) local result={} "
+        "for _,entity in pairs(entities or {}) do result[#result+1]=factoria_entity_reference(entity) end "
+        "return result end "
+        "local function factoria_attach_item_connections(info,entity) "
+        "if entity.type=='mining-drill' or entity.type=='inserter' then "
+        "local drop_target=entity.drop_target info.item_output={"
+        "position={x=entity.drop_position.x,y=entity.drop_position.y},connected=drop_target~=nil,"
+        "target=factoria_entity_reference(drop_target)} "
+        "end "
+        "if entity.type=='inserter' then local pickup_target=entity.pickup_target info.item_input={"
+        "position={x=entity.pickup_position.x,y=entity.pickup_position.y},connected=pickup_target~=nil,"
+        "target=factoria_entity_reference(pickup_target)} end "
+        "if entity.type=='mining-drill' then local area=entity.mining_area "
+        "info.mining_area={left_top={x=area.left_top.x,y=area.left_top.y},"
+        "right_bottom={x=area.right_bottom.x,y=area.right_bottom.y}} "
+        "info.mining_target=factoria_entity_reference(entity.mining_target) end end "
+        "local function factoria_attach_belt_connections(info,entity) "
+        "local belt_types={['transport-belt']=true,['underground-belt']=true,splitter=true,"
+        "loader=true,['loader-1x1']=true,['linked-belt']=true} if not belt_types[entity.type] then return end "
+        "local neighbours=entity.belt_neighbours info.belt_connections={"
+        "inputs=factoria_entity_references(neighbours.inputs),"
+        "outputs=factoria_entity_references(neighbours.outputs)} "
+        "if entity.type=='underground-belt' then info.belt_connections.underground="
+        "factoria_entity_reference(factoria_optional_property(entity,'underground_belt_neighbour') or "
+        "factoria_optional_property(entity,'neighbours')) end "
+        "if entity.type=='linked-belt' then info.belt_connections.linked="
+        "factoria_entity_reference(factoria_optional_property(entity,'linked_belt_neighbour') or "
+        "factoria_optional_property(entity,'neighbours')) end "
+        "end "
         "local function factoria_attach_fluid_details(info,entity) "
         "local owner_fluidbox=entity.fluidbox if not owner_fluidbox or #owner_fluidbox==0 then return end "
         "local boxes={} local connection_count=0 local connected_count=0 "
@@ -282,16 +396,40 @@ std::string EntityFluidDetailsLua()
         "position={x=connection.position.x,y=connection.position.y},"
         "target_position={x=connection.target_position.x,y=connection.target_position.y},"
         "connected=target_owner~=nil} "
-        "if target_owner then connection_info.target={name=target_owner.name,type=target_owner.type,"
-        "position={x=target_owner.position.x,y=target_owner.position.y},"
-        "direction=factoria_direction_name(target_owner.direction),unit_number=target_owner.unit_number} "
+        "if target_owner then connection_info.target=factoria_entity_reference(target_owner) "
         "connected_count=connected_count+1 end "
         "box.connections[#box.connections+1]=connection_info connection_count=connection_count+1 end "
         "boxes[#boxes+1]=box end info.fluidboxes=boxes "
         "info.fluid_connection_summary={total=connection_count,connected=connected_count,"
-        "open=connection_count-connected_count} "
-        "info.fluid_connection_hint='For each open port, place a pipe or compatible machine port at target_position; "
-        "do not infer connections from entity centers or sprite orientation.' end ";
+        "open=connection_count-connected_count} end "
+        "local function factoria_attach_electric_connections(info,entity) "
+        "local prototype=entity.prototype "
+        "if entity.type~='electric-pole' and not prototype.electric_energy_source_prototype then return end "
+        "info.electric_connection={network_id=entity.electric_network_id,"
+        "connected_to_power_source=entity.is_connected_to_electric_network()} "
+        "if entity.type=='electric-pole' then local radius=prototype.get_supply_area_distance(entity.quality.name) "
+        "info.electric_connection.supply_radius=radius info.electric_connection.supply_area={"
+        "left_top={x=entity.position.x-radius,y=entity.position.y-radius},"
+        "right_bottom={x=entity.position.x+radius,y=entity.position.y+radius}} "
+        "info.electric_connection.maximum_wire_distance=prototype.get_max_wire_distance(entity.quality.name) end end "
+        "local function factoria_attach_heat_connections(info,entity) "
+        "local prototype=entity.prototype "
+        "if not prototype.heat_buffer_prototype and not prototype.heat_energy_source_prototype then return end "
+        "info.heat_connections={neighbours=factoria_entity_references(entity.heat_neighbours)} end "
+        "local function factoria_attach_wall_connections(info,entity) "
+        "if entity.type~='wall' and entity.type~='gate' then return end "
+        "local neighbours=factoria_optional_property(entity,'wall_neighbours') or "
+        "factoria_optional_property(entity,'neighbours') "
+        "if not neighbours then return end "
+        "info.wall_connections={north=factoria_entity_reference(neighbours.north),"
+        "east=factoria_entity_reference(neighbours.east),south=factoria_entity_reference(neighbours.south),"
+        "west=factoria_entity_reference(neighbours.west)} end "
+        "local function factoria_attach_connection_details(info,entity) local box=entity.bounding_box "
+        "info.collision_box={left_top={x=box.left_top.x,y=box.left_top.y},"
+        "right_bottom={x=box.right_bottom.x,y=box.right_bottom.y}} "
+        "factoria_attach_item_connections(info,entity) factoria_attach_belt_connections(info,entity) "
+        "factoria_attach_fluid_details(info,entity) factoria_attach_electric_connections(info,entity) "
+        "factoria_attach_heat_connections(info,entity) factoria_attach_wall_connections(info,entity) end ";
 }
 
 void RejectUnknownArguments(const json& arguments, std::initializer_list<std::string_view> allowed)
@@ -300,7 +438,26 @@ void RejectUnknownArguments(const json& arguments, std::initializer_list<std::st
     {
         static_cast<void>(value);
         if (std::find(allowed.begin(), allowed.end(), name) == allowed.end())
-            throw std::runtime_error("Unexpected tool argument: " + name);
+        {
+            std::string message = "Unexpected tool argument: " + name + ". ";
+            if (allowed.size() == 0)
+            {
+                message += "This tool accepts no arguments";
+            }
+            else
+            {
+                message += "Allowed arguments: ";
+                bool first = true;
+                for (const auto argument : allowed)
+                {
+                    if (!first)
+                        message += ", ";
+                    message += argument;
+                    first = false;
+                }
+            }
+            throw std::runtime_error(message);
+        }
     }
 }
 
@@ -350,6 +507,11 @@ std::chrono::steady_clock::time_point DeadlineAfter(double seconds)
     return std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>(seconds));
 }
+
+double RemainingSeconds(std::chrono::steady_clock::time_point deadline)
+{
+    return std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count();
+}
 }
 
 FactorioTools::FactorioTools(
@@ -378,7 +540,7 @@ FactorioTools::FactorioTools(
             EmptyParameters()),
         FunctionTool(
             "get_research_status",
-            "Get current and queued lab research, startable technologies, and trigger-based milestones such as crafting an item or building an entity. Results include required science packs and unlocked recipes. Optionally inspect one exact technology, including unmet prerequisites.",
+            "Get current and queued lab research, startable technologies, and trigger-based milestones such as crafting an item or building an entity. Call with {} to list every currently relevant technology. Set technology only to an exact technology name returned by this tool; item and recipe names are not technology names. Omit the optional field when listing rather than sending an empty string or null.",
             {
                 {"type", "object"},
                 {"properties", {
@@ -399,7 +561,7 @@ FactorioTools::FactorioTools(
             }),
         FunctionTool(
             "get_nearby_entities",
-            "Return a page of up to 40 nearby entities with character-relative deltas. Fluid-capable entities include their actual input/output pipe ports, exact target positions, and connection state; use those fields to route pipes and verify machine orientation. Use regex for a case-insensitive ECMAScript search over both prototype names and entity types, for example regex='furnace' finds stone-furnace and every entity of type furnace. Exact name and type filters are also available. Distinct prototypes are returned before duplicates, and next_offset retrieves another page. This tool cannot find terrain tiles such as water; use find_water for water. Factorio X increases east and Y increases south, so a negative delta_y is north.",
+            "Return a page of up to 40 nearby entities with character-relative deltas and Factorio-resolved connection geometry. A minimal unfiltered call contains only radius. Omit name, type, and regex when they are unknown; never fill optional filters with empty strings or null. type must be a real Factorio entity type such as furnace, resource, or container; 'entity' is not a wildcard. regex searches both prototype names and entity types. Relevant entities report verified item, belt, fluid, electric, heat, wall, and collision geometry. Distinct prototypes precede duplicates and next_offset retrieves another page. This cannot find water tiles; use find_water. Factorio X increases east and Y increases south.",
             {
                 {"type", "object"},
                 {"properties", {
@@ -412,6 +574,28 @@ FactorioTools::FactorioTools(
                 {"required", {"radius"}},
                 {"additionalProperties", false},
             }),
+        FunctionTool(
+            "get_construction_requests",
+            "List nearby entity ghosts and entities explicitly marked for deconstruction, nearest first. Build requests include the exact prototype, direction, quality, required placement item, inventory count, and reachability. Use available_only=true to retain requests for which the controlled character has the required material or which are currently minable; distant requests remain available because the bounded service tools can walk to them.",
+            {
+                {"type", "object"},
+                {"properties", {
+                    {"radius", {{"type", "number"}, {"minimum", 1.0}, {"maximum", MaximumSearchRadius}}},
+                    {"kind", {{"type", "string"}, {"enum", {"all", "build", "deconstruct"}}, {"default", "all"}}},
+                    {"offset", {{"type", "integer"}, {"minimum", 0}, {"maximum", 10000}}},
+                    {"available_only", {{"type", "boolean"}, {"default", false}}},
+                }},
+                {"required", {"radius"}},
+                {"additionalProperties", false},
+            }),
+        FunctionTool(
+            "build_ghosts",
+            "Build up to count entity ghosts within radius, nearest first, using items from the controlled character's inventory. This bounded tool walks normally, checks reach, consumes the exact item quality, and revives the ghost so blueprint settings and item requests are preserved. It stops early on cancellation, timeout, missing materials, or an unreachable request.",
+            ConstructionBatchParameters()),
+        FunctionTool(
+            "deconstruct_marked",
+            "Mine up to count entities explicitly marked for deconstruction within radius, nearest first. This bounded tool walks normally and holds the character's mining input through the bridge runtime; it never sweeps unmarked buildings.",
+            ConstructionBatchParameters()),
         FunctionTool(
             "find_resource_patches",
             "Survey a large generated area for resource entities and return the nearest grouped patch regions with exact walking targets. Use resource='iron-ore', 'copper-ore', 'coal', 'stone', 'uranium-ore', or 'any'. Water is a terrain tile, not a resource; use find_water for water. Prefer this over wandering when locating ore.",
@@ -437,7 +621,7 @@ FactorioTools::FactorioTools(
             }),
         FunctionTool(
             "walk",
-            "Walk using normal player movement in a cardinal direction for a short duration, then return the new position.",
+            "Explore by walking in one cardinal direction for a short duration. This tool accepts only direction and duration_seconds; it does not accept coordinates or items. Use walk_to for map coordinates and walk_to_for_placement for an item plus build coordinates.",
             {
                 {"type", "object"},
                 {"properties", {
@@ -459,6 +643,23 @@ FactorioTools::FactorioTools(
                     {"maximum_duration_seconds", {{"type", "number"}, {"minimum", 1.0}, {"maximum", 120.0}, {"default", 60.0}}},
                 }},
                 {"required", {"x", "y"}},
+                {"additionalProperties", false},
+            }),
+        FunctionTool(
+            "find_connection_placement",
+            "Find exact coordinates and direction for placing an item so Factorio confirms an automatic spatial connection to one existing entity. This planner does not consume the item or leave a preview entity behind. Use item-from-target when the new entity must receive or pick up items from the target, item-to-target when it must drop items into the target, and the corresponding fluid, belt, electric, heat, or wall mode for those networks. Call the returned next_tool unchanged; do not calculate an offset from the target yourself.",
+            {
+                {"type", "object"},
+                {"properties", {
+                    {"item", {{"type", "string"}, {"minLength", 1}, {"maxLength", 128}}},
+                    {"target_x", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
+                    {"target_y", {{"type", "number"}, {"minimum", -1000000.0}, {"maximum", 1000000.0}}},
+                    {"connection", {{"type", "string"}, {"enum", {
+                        "item-from-target", "item-to-target", "fluid", "belt-from-target",
+                        "belt-to-target", "electric", "heat", "wall"}}}},
+                    {"search_radius", {{"type", "number"}, {"minimum", 1.0}, {"maximum", 64.0}, {"default", 8.0}}},
+                }},
+                {"required", {"item", "target_x", "target_y", "connection"}},
                 {"additionalProperties", false},
             }),
         FunctionTool(
@@ -508,7 +709,7 @@ FactorioTools::FactorioTools(
             }),
         FunctionTool(
             "place_entity",
-            "Place one buildable item from the controlled character's inventory on a reachable open tile using normal Factorio build rules. The item is consumed only when placement succeeds. Results for fluid-capable entities include actual input/output ports and connection state; connect open target positions with pipes and verify the final network with get_nearby_entities. Use walk_to_for_placement first when the exact target is distant or place_entity reports out_of_build_reach.",
+            "Place one buildable item from the controlled character's inventory on a reachable open tile using normal Factorio build rules. The item is consumed only when placement succeeds. The result includes Factorio-resolved connection geometry and actual connection targets. Use find_connection_placement whenever this entity must connect at a particular location, and use walk_to_for_placement before a distant exact placement.",
             PlacementParameters(false)),
         FunctionTool(
             "set_assembler_recipe",
@@ -633,6 +834,21 @@ json FactorioTools::Execute(const std::string& name, const json& arguments, std:
         RejectUnknownArguments(arguments, {"radius", "name", "type", "regex", "offset"});
         return GetNearbyEntities(arguments);
     }
+    if (name == "get_construction_requests")
+    {
+        RejectUnknownArguments(arguments, {"radius", "kind", "offset", "available_only"});
+        return GetConstructionRequests(arguments);
+    }
+    if (name == "build_ghosts")
+    {
+        RejectUnknownArguments(arguments, {"radius", "count", "maximum_duration_seconds"});
+        return BuildGhosts(arguments, stopToken);
+    }
+    if (name == "deconstruct_marked")
+    {
+        RejectUnknownArguments(arguments, {"radius", "count", "maximum_duration_seconds"});
+        return DeconstructMarked(arguments, stopToken);
+    }
     if (name == "find_resource_patches")
     {
         RejectUnknownArguments(arguments, {"resource", "radius"});
@@ -652,6 +868,11 @@ json FactorioTools::Execute(const std::string& name, const json& arguments, std:
     {
         RejectUnknownArguments(arguments, {"x", "y", "stopping_distance", "maximum_duration_seconds"});
         return WalkTo(arguments, stopToken);
+    }
+    if (name == "find_connection_placement")
+    {
+        RejectUnknownArguments(arguments, {"item", "target_x", "target_y", "connection", "search_radius"});
+        return FindConnectionPlacement(arguments);
     }
     if (name == "walk_to_for_placement")
     {
@@ -868,17 +1089,20 @@ json FactorioTools::GetGameState() const
 
 json FactorioTools::GetInventory() const
 {
-    return ExecuteJson(
+    auto result = ExecuteJson(
         ControlCharacterLua() +
         "local inv=p.get_main_inventory() local items={} "
         "if inv then for _,item in pairs(inv.get_contents()) do "
         "items[#items+1]={name=item.name,count=item.count,quality=tostring(item.quality)} end end "
         "table.sort(items,function(a,b) return a.name<b.name end) return {items=items}");
+    if (!result.value("items", json::array()).is_array())
+        result["items"] = json::array();
+    return result;
 }
 
 json FactorioTools::GetCraftableRecipes() const
 {
-    return ExecuteJson(
+    auto result = ExecuteJson(
         ControlCharacterLua() +
         "local recipes={} for name,recipe in pairs(p.force.recipes) do "
         "if recipe.enabled and name~='recipe-unknown' then local count=p.get_craftable_count(recipe) if count>0 then "
@@ -886,15 +1110,16 @@ json FactorioTools::GetCraftableRecipes() const
         "table.sort(recipes,function(a,b) return a.name<b.name end) "
         "local total=#recipes while #recipes>100 do table.remove(recipes) end "
         "return {recipes=recipes,total_count=total,truncated=total>#recipes}");
+    if (!result.value("recipes", json::array()).is_array())
+        result["recipes"] = json::array();
+    return result;
 }
 
 json FactorioTools::GetResearchStatus(const json& arguments) const
 {
-    const auto requestedTechnology = arguments.contains("technology")
-        ? RequiredPrototypeName(arguments, "technology")
-        : std::string{};
+    const auto requestedTechnology = PrototypeNameOrEmpty(arguments, "technology");
 
-    return ExecuteJson(
+    auto result = ExecuteJson(
         ControlCharacterLua() + ResearchHelpersLua(useDedicatedCharacter_) +
         "local force=p.force local queue,queued=factoria_research_queue(force) "
         + (requestedTechnology.empty()
@@ -918,6 +1143,13 @@ json FactorioTools::GetResearchStatus(const json& arguments) const
                 "local info=factoria_technology_info(technology) info.queued=queued[technology.name] or false "
                 "if force.current_research==technology then info.progress=force.research_progress end "
                 "return {research_enabled=force.research_enabled,technology=info,queue=queue}"));
+    for (const auto field : {"queue", "available", "triggered_milestones"})
+    {
+        const auto value = result.find(field);
+        if (value != result.end() && !value->is_array())
+            result[field] = json::array();
+    }
+    return result;
 }
 
 json FactorioTools::StartResearch(const json& arguments) const
@@ -948,18 +1180,16 @@ json FactorioTools::StartResearch(const json& arguments) const
 json FactorioTools::GetNearbyEntities(const json& arguments) const
 {
     const auto radius = RequiredNumber(arguments, "radius", 1.0, MaximumSearchRadius);
-    auto nameFilter = arguments.contains("name")
+    auto nameFilter = HasArgumentValue(arguments, "name")
         ? " filter.name=\"" + RequiredPrototypeName(arguments, "name") + "\" "
         : std::string{};
-    const auto typeFilter = arguments.contains("type")
+    const auto typeFilter = HasArgumentValue(arguments, "type")
         ? " filter.type=\"" + RequiredPrototypeName(arguments, "type") + "\" "
         : std::string{};
-    const auto offset = arguments.contains("offset")
-        ? RequiredInteger(arguments, "offset", 0, 10000)
-        : 0;
+    const auto offset = IntegerOrDefault(arguments, "offset", 0, 0, 10000);
 
     std::string regexResultField;
-    if (arguments.contains("regex"))
+    if (HasArgumentValue(arguments, "regex"))
     {
         const auto expression = RequiredText(arguments, "regex", 128);
         std::regex matcher;
@@ -1015,8 +1245,8 @@ json FactorioTools::GetNearbyEntities(const json& arguments) const
         regexResultField = "regex=" + LuaStringLiteral(expression) + ",";
     }
 
-    return ExecuteJson(
-        ControlCharacterLua() + EntityFluidDetailsLua() +
+    auto result = ExecuteJson(
+        ControlCharacterLua() + EntityConnectionDetailsLua() +
         "local function summarize(inv,limit) if not inv then return nil end local items={} "
         "for _,item in pairs(inv.get_contents()) do items[#items+1]={name=item.name,count=item.count} end "
         "table.sort(items,function(a,b) return a.count>b.count end) "
@@ -1056,7 +1286,7 @@ json FactorioTools::GetNearbyEntities(const json& arguments) const
         "attach_inventory(info,'output',e.get_inventory(defines.inventory.crafter_output),4) "
         "info.crafting=e.is_crafting() local recipe=e.get_recipe() info.recipe=recipe and recipe.name or nil "
         "if info.crafting then info.wait_tool='wait_for_machine_output' end end "
-        "factoria_attach_fluid_details(info,e) "
+        "factoria_attach_connection_details(info,e) "
         "entities[#entities+1]=info end "
         "return {radius=" + std::to_string(radius) + ",player_position={x=p.position.x,y=p.position.y},"
         "coordinate_hint='positive x is east; positive y is south',"
@@ -1064,6 +1294,219 @@ json FactorioTools::GetNearbyEntities(const json& arguments) const
         "ordering='nearest representative of each distinct prototype first, then nearest duplicate instances',"
         "offset=offset,total_entities=total,distinct_prototypes=distinct,truncated=offset+#entities<total,"
         "next_offset=offset+#entities<total and offset+#entities or nil,entities=entities}");
+    if (!result.value("entities", json::array()).is_array())
+        result["entities"] = json::array();
+    return result;
+}
+
+json FactorioTools::GetConstructionRequests(const json& arguments) const
+{
+    const auto radius = RequiredNumber(arguments, "radius", 1.0, MaximumSearchRadius);
+    const auto kind = HasArgumentValue(arguments, "kind")
+        ? RequiredText(arguments, "kind", 16)
+        : std::string("all");
+    if (kind != "all" && kind != "build" && kind != "deconstruct")
+        throw std::runtime_error("kind must be all, build, or deconstruct");
+    const auto offset = IntegerOrDefault(arguments, "offset", 0, 0, 10000);
+    const auto availableOnly = BooleanOrDefault(arguments, "available_only", false);
+
+    auto result = ExecuteJson(
+        ControlCharacterLua() + EntityConnectionDetailsLua() +
+        "local radius=" + std::to_string(radius) + " local kind=" + LuaStringLiteral(kind) + " "
+        "local available_only=" + std::string(availableOnly ? "true" : "false") + " "
+        "local inventory=p.get_main_inventory() local requests={} local missing={} "
+        "local function distance_to(entity) local dx=entity.position.x-p.position.x "
+        "local dy=entity.position.y-p.position.y return math.sqrt(dx*dx+dy*dy),dx,dy end "
+        "if kind=='all' or kind=='build' then "
+        "local ghosts=p.surface.find_entities_filtered{position=p.position,radius=radius,"
+        "type='entity-ghost',force=p.force} "
+        "for _,ghost in ipairs(ghosts) do if ghost.valid then "
+        "local prototype=prototypes.entity[ghost.ghost_name] "
+        "local quality=ghost.quality and ghost.quality.name or 'normal' "
+        "local required_item=nil local required_count=1 local selected_item=nil local item_count=0 "
+        "for _,item in ipairs(prototype and prototype.items_to_place_this or {}) do "
+        "local count=inventory and inventory.get_item_count{name=item.name,quality=quality} or 0 "
+        "if not required_item then required_item=item.name required_count=item.count or 1 item_count=count end "
+        "if not selected_item and count>=(item.count or 1) then selected_item=item.name "
+        "required_count=item.count or 1 item_count=count end end "
+        "local distance,dx,dy=distance_to(ghost) local available=selected_item~=nil "
+        "if not available and required_item then local key=required_item..':'..quality "
+        "local entry=missing[key] or {name=required_item,quality=quality,count=0} "
+        "entry.count=entry.count+required_count missing[key]=entry end "
+        "requests[#requests+1]={kind='build',entity_name=ghost.ghost_name,ghost_type=ghost.ghost_type,"
+        "position={x=ghost.position.x,y=ghost.position.y},delta={x=dx,y=dy},distance=distance,"
+        "direction=ghost.direction,direction_name=factoria_direction_name(ghost.direction),quality=quality,"
+        "item=selected_item or required_item,item_count=item_count,required_count=required_count,"
+        "available=available,reachable=p.can_reach_entity(ghost)} end end end "
+        "if kind=='all' or kind=='deconstruct' then "
+        "local marked=p.surface.find_entities_filtered{position=p.position,radius=radius,"
+        "force=p.force,to_be_deconstructed=true} "
+        "for _,entity in ipairs(marked) do if entity.valid and entity~=p and entity.type~='entity-ghost' "
+        "and entity.to_be_deconstructed(p.force) then "
+        "local distance,dx,dy=distance_to(entity) requests[#requests+1]={kind='deconstruct',"
+        "entity_name=entity.name,entity_type=entity.type,position={x=entity.position.x,y=entity.position.y},"
+        "delta={x=dx,y=dy},distance=distance,direction=entity.direction,"
+        "direction_name=factoria_direction_name(entity.direction),minable=entity.minable,"
+        "available=entity.minable,reachable=entity.minable and p.can_reach_entity(entity) or false} end end end "
+        "table.sort(requests,function(a,b) if a.distance~=b.distance then return a.distance<b.distance end "
+        "if a.kind~=b.kind then return a.kind<b.kind end if a.entity_name~=b.entity_name then "
+        "return a.entity_name<b.entity_name end if a.position.x~=b.position.x then "
+        "return a.position.x<b.position.x end return a.position.y<b.position.y end) "
+        "local total_all=#requests local available_count=0 local filtered={} "
+        "for _,request in ipairs(requests) do if request.available then available_count=available_count+1 end "
+        "if not available_only or request.available then filtered[#filtered+1]=request end end "
+        "local total=#filtered local page={} local offset=" + std::to_string(offset) + " "
+        "for index=offset+1,total do if #page>=40 then break end page[#page+1]=filtered[index] end "
+        "local missing_items={} for _,entry in pairs(missing) do missing_items[#missing_items+1]=entry end "
+        "table.sort(missing_items,function(a,b) if a.name~=b.name then return a.name<b.name end "
+        "return a.quality<b.quality end) "
+        "return {radius=radius,kind=kind,available_only=available_only,"
+        "player_position={x=p.position.x,y=p.position.y},coordinate_hint='positive x is east; positive y is south',"
+        "offset=offset,total_requests=total,total_requests_before_filter=total_all,"
+        "available_count=available_count,truncated=offset+#page<total,"
+        "next_offset=offset+#page<total and offset+#page or nil,missing_items=missing_items,requests=page}");
+    for (const auto field : {"missing_items", "requests"})
+    {
+        if (!result.value(field, json::array()).is_array())
+            result[field] = json::array();
+    }
+    return result;
+}
+
+json FactorioTools::BuildGhosts(const json& arguments, std::stop_token stopToken) const
+{
+    return ServiceConstructionRequests(arguments, "build", stopToken);
+}
+
+json FactorioTools::DeconstructMarked(const json& arguments, std::stop_token stopToken) const
+{
+    return ServiceConstructionRequests(arguments, "deconstruct", stopToken);
+}
+
+json FactorioTools::ServiceConstructionRequests(
+    const json& arguments,
+    const std::string& kind,
+    std::stop_token stopToken) const
+{
+    const auto batch = RequiredConstructionBatch(arguments);
+    const auto deadline = DeadlineAfter(batch.maximumSeconds);
+    json attempts = json::array();
+    json latestObservation = json::object();
+    int completedCount = 0;
+    std::string reason = "requested_count_met";
+
+    auto performRequest = [&](const json& request) {
+        if (kind == "build")
+            return BuildGhostAt(request);
+
+        auto miningRequest = request;
+        miningRequest["maximum_duration_seconds"] = std::clamp(RemainingSeconds(deadline), 1.0, 120.0);
+        return MineMarkedEntity(miningRequest, stopToken);
+    };
+
+    while (completedCount < batch.count)
+    {
+        if (stopToken.stop_requested())
+        {
+            reason = "stopped";
+            break;
+        }
+        if (RemainingSeconds(deadline) < 1.0)
+        {
+            reason = "timed_out";
+            break;
+        }
+
+        latestObservation = GetConstructionRequests({
+            {"radius", batch.radius},
+            {"kind", kind},
+            {"offset", 0},
+            {"available_only", true},
+        });
+        const auto requests = latestObservation.value("requests", json::array());
+        if (requests.empty())
+        {
+            reason = latestObservation.value("total_requests_before_filter", 0) == 0
+                ? "no_requests"
+                : "no_available_requests";
+            break;
+        }
+
+        const auto& request = requests.front();
+        auto actionResult = performRequest(request);
+        json navigation = json::object();
+        if (actionResult.value("out_of_reach", false))
+        {
+            const auto remaining = RemainingSeconds(deadline);
+            if (remaining < 1.0)
+            {
+                reason = "timed_out";
+                break;
+            }
+            const auto& position = request.at("position");
+            navigation = WalkTo(
+                {
+                    {"x", position.at("x")},
+                    {"y", position.at("y")},
+                    {"stopping_distance", 2.0},
+                    {"maximum_duration_seconds", std::clamp(remaining, 1.0, 120.0)},
+                },
+                stopToken);
+            if (stopToken.stop_requested())
+            {
+                attempts.push_back({{"request", request}, {"navigation", navigation}, {"action", actionResult}});
+                reason = "stopped";
+                break;
+            }
+            if (!navigation.value("reached", false))
+            {
+                attempts.push_back({{"request", request}, {"navigation", navigation}, {"action", actionResult}});
+                reason = "unreachable_request";
+                break;
+            }
+            actionResult = performRequest(request);
+        }
+
+        json attempt{{"request", request}, {"action", actionResult}};
+        if (!navigation.empty())
+            attempt["navigation"] = std::move(navigation);
+        attempts.push_back(std::move(attempt));
+
+        const auto completed = kind == "build"
+            ? actionResult.value("fulfilled", false)
+            : actionResult.value("mined", false);
+        if (!completed)
+        {
+            reason = actionResult.value("reason", "request_failed");
+            break;
+        }
+        ++completedCount;
+    }
+
+    if (!stopToken.stop_requested() && RemainingSeconds(deadline) > 0.0)
+    {
+        latestObservation = GetConstructionRequests({
+            {"radius", batch.radius},
+            {"kind", kind},
+            {"offset", 0},
+            {"available_only", false},
+        });
+    }
+
+    return {
+        {"kind", kind},
+        {"requested_count", batch.count},
+        {"completed_count", completedCount},
+        {"target_met", completedCount >= batch.count},
+        {"stopped", stopToken.stop_requested()},
+        {"timed_out", reason == "timed_out"},
+        {"reason", reason},
+        {"maximum_duration_seconds", batch.maximumSeconds},
+        {"attempts", std::move(attempts)},
+        {"remaining_requests", latestObservation.value("total_requests", 0)},
+        {"remaining_available", latestObservation.value("available_count", 0)},
+        {"missing_items", latestObservation.value("missing_items", json::array())},
+    };
 }
 
 json FactorioTools::FindResourcePatches(const json& arguments) const
@@ -1073,7 +1516,7 @@ json FactorioTools::FindResourcePatches(const json& arguments) const
     const auto nameFilter = resource == "any"
         ? std::string{}
         : " filter.name=\"" + resource + "\" ";
-    return ExecuteJson(
+    auto result = ExecuteJson(
         ControlCharacterLua() +
         "local filter={position=p.position,radius=" + std::to_string(radius) + ",type='resource'} " +
         nameFilter +
@@ -1101,12 +1544,15 @@ json FactorioTools::FindResourcePatches(const json& arguments) const
         "return {requested_resource=\"" + resource + "\",radius=" + std::to_string(radius) +
         ",player_position={x=p.position.x,y=p.position.y},coordinate_hint='positive x is east; positive y is south',"
         "grouping='32-tile survey cells; adjacent results can belong to one physical patch',patches=patches} ");
+    if (!result.value("patches", json::array()).is_array())
+        result["patches"] = json::array();
+    return result;
 }
 
 json FactorioTools::FindWater(const json& arguments) const
 {
     const auto radius = RequiredNumber(arguments, "radius", 32.0, MaximumSearchRadius);
-    return ExecuteJson(
+    auto result = ExecuteJson(
         ControlCharacterLua() +
         "local radius=" + std::to_string(radius) + " local water_names={} "
         "for name,prototype in pairs(prototypes.tile) do "
@@ -1159,6 +1605,13 @@ json FactorioTools::FindWater(const json& arguments) const
         "base.found=#tiles>0 base.nearest_water_distance=upper base.shorelines=shorelines "
         "if #shorelines==0 then base.reason='Water was found, but no adjacent walkable shoreline was found in the nearest sample' end "
         "return base");
+    for (const auto field : {"water_tile_prototypes", "shorelines"})
+    {
+        const auto value = result.find(field);
+        if (value != result.end() && !value->is_array())
+            result[field] = json::array();
+    }
+    return result;
 }
 
 json FactorioTools::Walk(const json& arguments, std::stop_token stopToken) const
@@ -1269,6 +1722,152 @@ json FactorioTools::WalkTo(const json& arguments, std::stop_token stopToken) con
     result["pathfinder_available"] = true;
     result["walking_control"] = "factorio_bridge_runtime";
     return result;
+}
+
+json FactorioTools::FindConnectionPlacement(const json& arguments) const
+{
+    const auto item = RequiredPrototypeName(arguments, "item");
+    const auto targetX = RequiredNumber(arguments, "target_x", -1000000.0, 1000000.0);
+    const auto targetY = RequiredNumber(arguments, "target_y", -1000000.0, 1000000.0);
+    const auto connection = RequiredText(arguments, "connection", 32);
+    const auto searchRadius = NumberOrDefault(arguments, "search_radius", 8.0, 1.0, 64.0);
+    static const std::vector<std::string_view> connectionKinds{
+        "item-from-target",
+        "item-to-target",
+        "fluid",
+        "belt-from-target",
+        "belt-to-target",
+        "electric",
+        "heat",
+        "wall",
+    };
+    if (std::find(connectionKinds.begin(), connectionKinds.end(), connection) == connectionKinds.end())
+        throw std::runtime_error("Unknown spatial connection type: " + connection);
+
+    return ExecuteJson(
+        EntityLookupLua(
+            ControlCharacterLua() + EntityConnectionDetailsLua(),
+            targetX,
+            targetY,
+            "candidate.valid and candidate.force==p.force and candidate.type~='resource' "
+                "and candidate.type~='item-entity' and candidate.type~='character'",
+            "connectable entity",
+            false) +
+        "local item_name=" + LuaStringLiteral(item) + " local item=prototypes.item[item_name] "
+        "if not item then error('Unknown item prototype: ' .. item_name) end "
+        "local place_result=item.place_result "
+        "if not place_result then error('Item cannot be placed as an entity: ' .. item_name) end "
+        "local connection_kind=" + LuaStringLiteral(connection) + " "
+        "local search_radius=" + std::to_string(searchRadius) + " "
+        "local function position_info(position) if not position then return nil end "
+        "return {x=position.x,y=position.y} end "
+        "local function contains(entities,expected) for _,entity in pairs(entities or {}) do "
+        "if entity==expected then return true end end return false end "
+        "local function item_connection(candidate) "
+        "if connection_kind=='item-from-target' then "
+        "if factoria_optional_property(target,'drop_target')==candidate then return {kind='item',flow='target-to-new',"
+        "endpoint_owner='target',endpoint=position_info(factoria_optional_property(target,'drop_position'))} end "
+        "if factoria_optional_property(candidate,'pickup_target')==target then return {kind='item',flow='target-to-new',"
+        "endpoint_owner='new',endpoint=position_info(factoria_optional_property(candidate,'pickup_position'))} end "
+        "elseif connection_kind=='item-to-target' then "
+        "if factoria_optional_property(candidate,'drop_target')==target then return {kind='item',flow='new-to-target',"
+        "endpoint_owner='new',endpoint=position_info(factoria_optional_property(candidate,'drop_position'))} end "
+        "if factoria_optional_property(target,'pickup_target')==candidate then return {kind='item',flow='new-to-target',"
+        "endpoint_owner='target',endpoint=position_info(factoria_optional_property(target,'pickup_position'))} end end "
+        "return nil end "
+        "local function fluid_connection(candidate) "
+        "if connection_kind~='fluid' then return nil end local owner_fluidbox=candidate.fluidbox "
+        "if not owner_fluidbox then return nil end for index=1,#owner_fluidbox do "
+        "for connection_index,pipe in ipairs(owner_fluidbox.get_pipe_connections(index)) do "
+        "local owner=pipe.target and pipe.target.owner or nil if owner==target then return {kind='fluid',"
+        "fluidbox_index=index,connection_index=connection_index,position=position_info(pipe.position),"
+        "target_position=position_info(pipe.target_position),flow_direction=pipe.flow_direction} end end end "
+        "return nil end "
+        "local function belt_connection(candidate) "
+        "if connection_kind~='belt-from-target' and connection_kind~='belt-to-target' then return nil end "
+        "local candidate_neighbours=factoria_optional_property(candidate,'belt_neighbours') "
+        "local target_neighbours=factoria_optional_property(target,'belt_neighbours') "
+        "if connection_kind=='belt-from-target' and ((candidate_neighbours and "
+        "contains(candidate_neighbours.inputs,target)) or (target_neighbours and "
+        "contains(target_neighbours.outputs,candidate))) then return {kind='belt',flow='target-to-new'} end "
+        "if connection_kind=='belt-to-target' and ((candidate_neighbours and "
+        "contains(candidate_neighbours.outputs,target)) or (target_neighbours and "
+        "contains(target_neighbours.inputs,candidate))) then return {kind='belt',flow='new-to-target'} end "
+        "local candidate_underground=factoria_optional_property(candidate,'underground_belt_neighbour') or "
+        "factoria_optional_property(candidate,'neighbours') "
+        "if candidate_underground==target then local candidate_type=factoria_optional_property(candidate,'belt_to_ground_type') "
+        "local target_type=factoria_optional_property(target,'belt_to_ground_type') "
+        "if connection_kind=='belt-from-target' and target_type=='input' and candidate_type=='output' then "
+        "return {kind='underground-belt',flow='target-to-new'} end "
+        "if connection_kind=='belt-to-target' and candidate_type=='input' and target_type=='output' then "
+        "return {kind='underground-belt',flow='new-to-target'} end end return nil end "
+        "local function electric_connection(candidate) if connection_kind~='electric' then return nil end "
+        "local candidate_network=factoria_optional_property(candidate,'electric_network_id') "
+        "local target_network=factoria_optional_property(target,'electric_network_id') "
+        "if candidate_network and candidate_network==target_network then return {kind='electric',"
+        "network_id=candidate_network} end return nil end "
+        "local function heat_connection(candidate) if connection_kind~='heat' then return nil end "
+        "if contains(factoria_optional_property(candidate,'heat_neighbours'),target) or "
+        "contains(factoria_optional_property(target,'heat_neighbours'),candidate) then return {kind='heat'} end return nil end "
+        "local function wall_connection(candidate) if connection_kind~='wall' then return nil end "
+        "local neighbours=factoria_optional_property(candidate,'wall_neighbours') or "
+        "factoria_optional_property(candidate,'neighbours') "
+        "if neighbours and (neighbours.north==target or neighbours.east==target or "
+        "neighbours.south==target or neighbours.west==target) then return {kind='wall'} end return nil end "
+        "local function find_connection(candidate) return item_connection(candidate) or fluid_connection(candidate) "
+        "or belt_connection(candidate) or electric_connection(candidate) or heat_connection(candidate) "
+        "or wall_connection(candidate) end "
+        "local directions={{name='north',value=defines.direction.north,swap=false},"
+        "{name='east',value=defines.direction.east,swap=true},"
+        "{name='south',value=defines.direction.south,swap=false},"
+        "{name='west',value=defines.direction.west,swap=true}} "
+        "if not place_result.supports_direction then directions={directions[1]} end "
+        "local candidates={} for _,direction in ipairs(directions) do "
+        "local width=direction.swap and place_result.tile_height or place_result.tile_width "
+        "local height=direction.swap and place_result.tile_width or place_result.tile_height "
+        "local x_offset=width%2==0 and 0 or 0.5 local y_offset=height%2==0 and 0 or 0.5 "
+        "local minimum_x=math.ceil(target.position.x-search_radius-x_offset) "
+        "local maximum_x=math.floor(target.position.x+search_radius-x_offset) "
+        "local minimum_y=math.ceil(target.position.y-search_radius-y_offset) "
+        "local maximum_y=math.floor(target.position.y+search_radius-y_offset) "
+        "for grid_x=minimum_x,maximum_x do for grid_y=minimum_y,maximum_y do "
+        "local x=grid_x+x_offset local y=grid_y+y_offset local target_dx=x-target.position.x "
+        "local target_dy=y-target.position.y if target_dx*target_dx+target_dy*target_dy<=search_radius*search_radius then "
+        "local player_dx=x-p.position.x local player_dy=y-p.position.y candidates[#candidates+1]={"
+        "x=x,y=y,direction=direction.name,direction_value=direction.value,"
+        "distance_from_player=math.sqrt(player_dx*player_dx+player_dy*player_dy),"
+        "distance_from_target=math.sqrt(target_dx*target_dx+target_dy*target_dy)} end end end end "
+        "table.sort(candidates,function(a,b) if a.distance_from_target==b.distance_from_target then "
+        "return a.distance_from_player<b.distance_from_player end return a.distance_from_target<b.distance_from_target end) "
+        "local inventory=p.get_main_inventory() local source=inventory and inventory.find_item_stack(item_name) "
+        "local quality=source and source.quality.name or 'normal' local options={} "
+        "for _,candidate in ipairs(candidates) do if #options>=12 then break end "
+        "local build={name=place_result.name,position={x=candidate.x,y=candidate.y},"
+        "direction=candidate.direction_value,force=p.force,quality=quality,create_build_effect_smoke=false} "
+        "if p.surface.can_place_entity{name=place_result.name,position=build.position,direction=build.direction,"
+        "force=p.force,build_check_type=defines.build_check_type.manual} then "
+        "local created,preview=pcall(function() return p.surface.create_entity(build) end) "
+        "if created and preview then local inspected,option=pcall(function() "
+        "pcall(function() preview.update_connections() end) pcall(function() target.update_connections() end) "
+        "local matched=find_connection(preview) if not matched then return nil end "
+        "local entity_info={name=preview.name,type=preview.type,"
+        "position={x=preview.position.x,y=preview.position.y},direction_name=factoria_direction_name(preview.direction)} "
+        "factoria_attach_connection_details(entity_info,preview) return {"
+        "x=candidate.x,y=candidate.y,direction=candidate.direction,"
+        "distance_from_player=candidate.distance_from_player,"
+        "distance_from_target=candidate.distance_from_target,connection=matched,preview=entity_info} end) "
+        "preview.destroy() pcall(function() target.update_connections() end) "
+        "if not inspected then error(option) end if option then options[#options+1]=option end end end end "
+        "table.sort(options,function(a,b) return a.distance_from_player<b.distance_from_player end) "
+        "local result={found=#options>0,item=item_name,entity_name=place_result.name,"
+        "item_count=inventory and inventory.get_item_count(item_name) or 0,"
+        "connection=connection_kind,search_radius=search_radius,target=factoria_entity_reference(target),"
+        "options=options,preview_entities_removed=true} "
+        "if #options>0 then local recommended=options[1] local next_arguments={item=item_name,x=recommended.x,"
+        "y=recommended.y,direction=recommended.direction} result.recommended=recommended "
+        "result.next_tool={name='walk_to_for_placement',arguments=next_arguments} "
+        "result.verification='After placement, require the reported connection target or network to match this target.' "
+        "else result.reason='no_valid_connected_placement_in_search_radius' end return result");
 }
 
 json FactorioTools::WalkToForPlacement(const json& arguments, std::stop_token stopToken) const
@@ -1500,12 +2099,45 @@ json FactorioTools::MineEntity(const json& arguments, std::stop_token stopToken)
     const auto targetName = RequiredPrototypeName(arguments, "name");
     const auto count = RequiredInteger(arguments, "count", 1, 200);
     const auto maximumSeconds = std::max(10.0, static_cast<double>(count) * 2.5 + 5.0);
-    const auto start = StartPlayerControlAction({
-        {"kind", "mine"},
-        {"name", targetName},
-        {"count", count},
-        {"maximum_duration_seconds", maximumSeconds},
-    });
+    return RunMiningAction(
+        {
+            {"kind", "mine"},
+            {"name", targetName},
+            {"count", count},
+            {"maximum_duration_seconds", maximumSeconds},
+        },
+        targetName,
+        maximumSeconds,
+        stopToken);
+}
+
+json FactorioTools::MineMarkedEntity(const json& request, std::stop_token stopToken) const
+{
+    const auto targetName = RequiredPrototypeName(request, "entity_name");
+    const auto targetX = request.at("position").at("x").get<double>();
+    const auto targetY = request.at("position").at("y").get<double>();
+    const auto maximumSeconds = RequiredNumber(request, "maximum_duration_seconds", 1.0, 120.0);
+    return RunMiningAction(
+        {
+            {"kind", "mine_marked"},
+            {"name", targetName},
+            {"count", 1},
+            {"target_x", targetX},
+            {"target_y", targetY},
+            {"maximum_duration_seconds", maximumSeconds},
+        },
+        targetName,
+        maximumSeconds,
+        stopToken);
+}
+
+json FactorioTools::RunMiningAction(
+    json runtimeArguments,
+    const std::string& targetName,
+    double maximumSeconds,
+    std::stop_token stopToken) const
+{
+    const auto start = StartPlayerControlAction(runtimeArguments);
     auto result = WaitForPlayerControlAction(
         start,
         DeadlineAfter(maximumSeconds + 2.0),
@@ -1599,13 +2231,68 @@ json FactorioTools::Craft(const json& arguments, std::stop_token stopToken) cons
     return result;
 }
 
+json FactorioTools::BuildGhostAt(const json& request) const
+{
+    const auto entityName = RequiredPrototypeName(request, "entity_name");
+    const auto itemName = RequiredPrototypeName(request, "item");
+    const auto targetX = request.at("position").at("x").get<double>();
+    const auto targetY = request.at("position").at("y").get<double>();
+
+    auto result = ExecuteJson(
+        ControlCharacterLua() + EntityConnectionDetailsLua() +
+        "local entity_name=" + LuaStringLiteral(entityName) + " local item_name=" + LuaStringLiteral(itemName) + " "
+        "local position={x=" + std::to_string(targetX) + ",y=" + std::to_string(targetY) + "} "
+        "local ghosts=p.surface.find_entities_filtered{position=position,radius=0.25,"
+        "type='entity-ghost',ghost_name=entity_name} local ghost=ghosts[1] "
+        "if not ghost or not ghost.valid then return {fulfilled=false,missing=true,reason='ghost_missing'} end "
+        "if not p.can_reach_entity(ghost) then return {fulfilled=false,out_of_reach=true,"
+        "reason='ghost_out_of_reach',position=position} end "
+        "local inventory=p.get_main_inventory() if not inventory then "
+        "error('Controlled character has no main inventory') end "
+        "local quality=ghost.quality and ghost.quality.name or 'normal' "
+        "local prototype=prototypes.entity[ghost.ghost_name] local required_count=nil "
+        "for _,item in ipairs(prototype and prototype.items_to_place_this or {}) do "
+        "if item.name==item_name then required_count=item.count or 1 break end end "
+        "if not required_count then return {fulfilled=false,reason='item_does_not_build_ghost',"
+        "item=item_name,entity_name=ghost.ghost_name} end "
+        "local available=inventory.get_item_count{name=item_name,quality=quality} "
+        "if available<required_count then return {fulfilled=false,reason='missing_item',item=item_name,"
+        "quality=quality,required_count=required_count,item_count=available} end "
+        "local removed=inventory.remove{name=item_name,count=required_count,quality=quality} "
+        "if removed~=required_count then if removed>0 then inventory.insert{name=item_name,count=removed,quality=quality} end "
+        "return {fulfilled=false,reason='item_could_not_be_reserved',item=item_name,quality=quality} end "
+        "local revived,collided,entity,proxy=pcall(function() "
+        "return ghost.revive{raise_revive=true,overflow=inventory} end) "
+        "if not revived or not entity then inventory.insert{name=item_name,count=removed,quality=quality} "
+        "return {fulfilled=false,reason='ghost_could_not_be_revived',"
+        "error=not revived and tostring(collided) or nil,item=item_name,quality=quality} end "
+        "local info={name=entity.name,type=entity.type,quality=entity.quality.name,"
+        "position={x=entity.position.x,y=entity.position.y},direction=entity.direction,"
+        "direction_name=factoria_direction_name(entity.direction),unit_number=entity.unit_number} "
+        "factoria_attach_connection_details(info,entity) "
+        "return {fulfilled=true,item=item_name,item_quality=quality,consumed_count=removed,"
+        "remaining_item_count=inventory.get_item_count{name=item_name,quality=quality},"
+        "collided_items=collided or {},item_request_proxy_created=proxy~=nil,entity=info}");
+
+    if (result.value("fulfilled", false))
+    {
+        const auto& entity = result.at("entity");
+        result["research_trigger_tracking"] = RecordResearchTriggerAction(
+            "build-entity",
+            entity.at("name").get<std::string>(),
+            entity.value("quality", "normal"),
+            1.0);
+    }
+    return result;
+}
+
 json FactorioTools::PlaceEntity(const json& arguments) const
 {
     const auto request = RequiredPlacementRequest(arguments);
     const auto direction = DirectionExpression(request.direction);
 
     auto result = ExecuteJson(
-        ControlCharacterLua() + EntityFluidDetailsLua() +
+        ControlCharacterLua() + EntityConnectionDetailsLua() +
         "local inv=p.get_main_inventory() if not inv then error('Controlled character has no main inventory') end "
         "local item_name=" + LuaStringLiteral(request.item) + " local source=inv.find_item_stack(item_name) "
         "if not source then error('Player does not have item: " + request.item + "') end "
@@ -1627,7 +2314,7 @@ json FactorioTools::PlaceEntity(const json& arguments) const
         "if entity then result.entity={name=entity.name,type=entity.type,quality=entity.quality.name,"
         "position={x=entity.position.x,y=entity.position.y},direction=entity.direction,"
         "direction_name=factoria_direction_name(entity.direction),unit_number=entity.unit_number} "
-        "factoria_attach_fluid_details(result.entity,entity) end "
+        "factoria_attach_connection_details(result.entity,entity) end "
         "if not accepted and target_valid then result.reason='out_of_build_reach'; result.suggested_tool='walk_to_for_placement' "
         "elseif not accepted then result.reason='invalid_build_target_or_direction' "
         "elseif not placed then result.reason='Factorio accepted the build but the placed entity could not be verified' end "

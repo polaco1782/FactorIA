@@ -86,6 +86,22 @@ local function find_mining_target(player, name)
     return best, best_reachable
 end
 
+local function find_marked_mining_target(player, name, position)
+    local entities = player.surface.find_entities_filtered {
+        position = position,
+        radius = 0.25,
+        name = name,
+        force = player.force,
+        to_be_deconstructed = true
+    }
+    for _, entity in ipairs(entities) do
+        if entity.valid and entity.minable and entity.to_be_deconstructed(player.force) then
+            return entity, player.can_reach_entity(entity)
+        end
+    end
+    return nil, false
+end
+
 local function begin_mining_target(state, entity)
     state.entity = entity
     state.entity_name = entity.name
@@ -161,7 +177,7 @@ function action.start(arguments)
             best_distance = math.huge
         }
         return state
-    elseif kind == "mine" then
+    elseif kind == "mine" or kind == "mine_marked" then
         local requested_name = arguments.name
         local requested_count = arguments.count
         if type(requested_name) ~= "string" or #requested_name == 0 then
@@ -170,14 +186,25 @@ function action.start(arguments)
         if type(requested_count) ~= "number" or requested_count < 1 or requested_count % 1 ~= 0 then
             error("Mining count must be a positive integer")
         end
-        local entity, reachable = find_mining_target(player, requested_name)
+        local deconstruction_request = kind == "mine_marked"
+        local entity, reachable
+        if deconstruction_request then
+            local position = {x = arguments.target_x, y = arguments.target_y}
+            if type(position.x) ~= "number" or type(position.y) ~= "number" then
+                error("Marked mining requires an exact target position")
+            end
+            entity, reachable = find_marked_mining_target(player, requested_name, position)
+        else
+            entity, reachable = find_mining_target(player, requested_name)
+        end
         if not entity then
             stop_mining(player)
             return nil, {
                 mined = false,
                 missing = true,
                 entity_present = false,
-                requested_name = requested_name
+                requested_name = requested_name,
+                deconstruction_request = deconstruction_request
             }
         end
         -- Batch counts apply to resource amounts; a discrete entity is mined only once.
@@ -189,17 +216,19 @@ function action.start(arguments)
                 out_of_reach = true,
                 entity_present = true,
                 requested_name = requested_name,
+                deconstruction_request = deconstruction_request,
                 entity = {name = entity.name, position = entity.position}
             }
         end
 
         local state = {
-            kind = kind,
+            kind = "mine",
             player = player,
             requested_name = requested_name,
             requested_count = requested_count,
             effective_count = effective_count,
             resource_target = entity.type == "resource",
+            deconstruction_request = deconstruction_request,
             mined_count = 0,
             deadline_tick = game.tick + math.max(1, math.ceil(arguments.maximum_duration_seconds * 60))
         }
@@ -279,6 +308,7 @@ local function with_mining_counts(state, result, count)
     result.effective_count = state.effective_count
     result.count_adjusted = state.requested_count ~= state.effective_count
     result.requested_name = state.requested_name
+    result.deconstruction_request = state.deconstruction_request or false
     return result
 end
 

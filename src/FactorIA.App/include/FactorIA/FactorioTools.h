@@ -49,10 +49,18 @@ private:
     nlohmann::json GetResearchStatus(const nlohmann::json& arguments) const;
     nlohmann::json StartResearch(const nlohmann::json& arguments) const;
     nlohmann::json GetNearbyEntities(const nlohmann::json& arguments) const;
+    nlohmann::json GetConstructionRequests(const nlohmann::json& arguments) const;
+    nlohmann::json BuildGhosts(const nlohmann::json& arguments, std::stop_token stopToken) const;
+    nlohmann::json DeconstructMarked(const nlohmann::json& arguments, std::stop_token stopToken) const;
+    nlohmann::json ServiceConstructionRequests(
+        const nlohmann::json& arguments,
+        const std::string& kind,
+        std::stop_token stopToken) const;
     nlohmann::json FindResourcePatches(const nlohmann::json& arguments) const;
     nlohmann::json FindWater(const nlohmann::json& arguments) const;
     nlohmann::json Walk(const nlohmann::json& arguments, std::stop_token stopToken) const;
     nlohmann::json WalkTo(const nlohmann::json& arguments, std::stop_token stopToken) const;
+    nlohmann::json FindConnectionPlacement(const nlohmann::json& arguments) const;
     nlohmann::json WalkToForPlacement(
         const nlohmann::json& arguments,
         std::stop_token stopToken) const;
@@ -60,8 +68,15 @@ private:
     nlohmann::json StopWalking() const;
     nlohmann::json TakeScreenshot(const nlohmann::json& arguments, std::stop_token stopToken) const;
     nlohmann::json MineEntity(const nlohmann::json& arguments, std::stop_token stopToken) const;
+    nlohmann::json MineMarkedEntity(const nlohmann::json& request, std::stop_token stopToken) const;
+    nlohmann::json RunMiningAction(
+        nlohmann::json runtimeArguments,
+        const std::string& targetName,
+        double maximumSeconds,
+        std::stop_token stopToken) const;
     nlohmann::json Craft(const nlohmann::json& arguments, std::stop_token stopToken) const;
     nlohmann::json PlaceEntity(const nlohmann::json& arguments) const;
+    nlohmann::json BuildGhostAt(const nlohmann::json& request) const;
     nlohmann::json SetAssemblerRecipe(const nlohmann::json& arguments) const;
     nlohmann::json InsertItemIntoEntity(const nlohmann::json& arguments) const;
     nlohmann::json TakeItemFromEntity(const nlohmann::json& arguments) const;

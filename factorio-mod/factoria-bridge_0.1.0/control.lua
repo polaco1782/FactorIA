@@ -14,6 +14,17 @@ local function ensure_storage()
     storage.research_trigger_progress = storage.research_trigger_progress or {}
 end
 
+local function stored_agent_character()
+    ensure_storage()
+    local character = storage.agent_character
+    if character and character.valid then
+        return character
+    end
+
+    storage.agent_character = nil
+    return nil
+end
+
 local function connected_character()
     local player = game.connected_players[1]
     if not player or not player.valid or not player.character or not player.character.valid then
@@ -23,9 +34,9 @@ local function connected_character()
 end
 
 local function ensure_agent_character()
-    ensure_storage()
-    if storage.agent_character and storage.agent_character.valid then
-        return storage.agent_character
+    local existing = stored_agent_character()
+    if existing then
+        return existing
     end
 
     local surface = game.get_surface("nauvis") or game.surfaces[1]
@@ -197,6 +208,84 @@ local function stop_job_control(job)
     end
 end
 
+local function stop_all_runtime_jobs()
+    local job_ids = {}
+    for job_id in pairs(runtime_jobs) do
+        job_ids[#job_ids + 1] = job_id
+    end
+    table.sort(job_ids)
+
+    for _, job_id in ipairs(job_ids) do
+        stop_job_control(runtime_jobs[job_id])
+        runtime_jobs[job_id] = nil
+        runtime_results[job_id] = nil
+    end
+    return #job_ids
+end
+
+local function remove_agent_character()
+    local stopped_jobs = stop_all_runtime_jobs()
+    local character = stored_agent_character()
+    if not character then
+        return {removed = false, stopped_jobs = stopped_jobs, spilled_item_entities = 0}
+    end
+
+    local spilled_item_entities = 0
+    for inventory_index = 1, character.get_max_inventory_index() do
+        local inventory = character.get_inventory(inventory_index)
+        if inventory and inventory.valid and not inventory.is_empty() then
+            local spilled = character.surface.spill_inventory {
+                position = character.position,
+                inventory = inventory,
+                enable_looted = true,
+                force = character.force,
+                allow_belts = false
+            }
+            spilled_item_entities = spilled_item_entities + #spilled
+        end
+    end
+    local removed = character.destroy()
+    if removed then
+        storage.agent_character = nil
+    end
+    return {
+        removed = removed,
+        stopped_jobs = stopped_jobs,
+        spilled_item_entities = spilled_item_entities
+    }
+end
+
+local function agent_status()
+    local character = stored_agent_character()
+    local jobs = {}
+    for job_id, job in pairs(runtime_jobs) do
+        jobs[#jobs + 1] = {id = job_id, action = job.action_name or "unknown"}
+    end
+    table.sort(jobs, function(left, right) return left.id < right.id end)
+
+    local installed_actions = {}
+    for action_name in pairs(runtime_actions) do
+        installed_actions[#installed_actions + 1] = action_name
+    end
+    table.sort(installed_actions)
+
+    local result = {
+        spawned = character ~= nil,
+        active_jobs = jobs,
+        installed_actions = installed_actions,
+        runtime_version = runtime_version
+    }
+    if character then
+        result.character = {
+            unit_number = character.unit_number,
+            position = character.position,
+            surface = character.surface.name,
+            force = character.force.name
+        }
+    end
+    return result
+end
+
 local function finish_job(job_id, result)
     local job = runtime_jobs[job_id]
     if not job then
@@ -284,6 +373,26 @@ script.on_event(defines.events.on_tick, function()
 end)
 
 remote.add_interface(interface_name, {
+    agent_status = agent_status,
+
+    spawn_agent_character = function()
+        local existed = stored_agent_character() ~= nil
+        local character = ensure_agent_character()
+        return {
+            created = not existed,
+            unit_number = character.unit_number,
+            position = character.position,
+            surface = character.surface.name,
+            force = character.force.name
+        }
+    end,
+
+    remove_agent_character = remove_agent_character,
+
+    stop_all_actions = function()
+        return {stopped_jobs = stop_all_runtime_jobs()}
+    end,
+
     get_control_character = function(use_dedicated_character)
         return control_character(use_dedicated_character == true)
     end,
@@ -396,7 +505,7 @@ remote.add_interface(interface_name, {
             return {active = false, job_id = job_id, result = immediate_result or {completed = true}}
         end
 
-        runtime_jobs[job_id] = {action = action, state = state}
+        runtime_jobs[job_id] = {action_name = action_name, action = action, state = state}
         return {active = true, job_id = job_id}
     end,
 
@@ -479,3 +588,162 @@ remote.add_interface(interface_name, {
         return result
     end
 })
+
+local function command_player(command)
+    if not command.player_index then
+        return nil
+    end
+    return game.get_player(command.player_index)
+end
+
+local function command_print(command, message, color)
+    local player = command_player(command)
+    local print_settings = color and {color = color} or nil
+    if player then
+        player.print(message, print_settings)
+    else
+        game.print(message, print_settings)
+    end
+end
+
+local function require_command_admin(command)
+    local player = command_player(command)
+    if not player or player.admin then
+        return true
+    end
+    player.print(
+        "[FactorIA] This command requires administrator permission.",
+        {color = {r = 1, g = 0.5, b = 0.3}})
+    return false
+end
+
+local function position_beside(surface, target)
+    local offsets = {
+        {x = 1.5, y = 0}, {x = -1.5, y = 0}, {x = 0, y = 1.5}, {x = 0, y = -1.5},
+        {x = 1.5, y = 1.5}, {x = -1.5, y = -1.5}, {x = 1.5, y = -1.5}, {x = -1.5, y = 1.5}
+    }
+    for _, offset in ipairs(offsets) do
+        local candidate = surface.find_non_colliding_position(
+            "character",
+            {x = target.x + offset.x, y = target.y + offset.y},
+            4,
+            0.25)
+        if candidate then
+            local dx = candidate.x - target.x
+            local dy = candidate.y - target.y
+            if dx * dx + dy * dy >= 1 then
+                return candidate
+            end
+        end
+    end
+    return nil
+end
+
+local function print_command_help(command)
+    command_print(
+        command,
+        "[FactorIA] /factoria-agent status|spawn|come|goto|remove",
+        {r = 0.4, g = 0.85, b = 1})
+end
+
+commands.add_command(
+    "factoria-agent",
+    "Inspect or manage the dedicated FactorIA character: /factoria-agent status|spawn|come|goto|remove",
+    function(command)
+        local operation = (command.parameter or ""):lower():match("^%s*(%S+)")
+        if not operation or operation == "help" then
+            print_command_help(command)
+            return
+        end
+
+        if operation == "status" then
+            local status = agent_status()
+            if not status.spawned then
+                command_print(
+                    command,
+                    string.format("[FactorIA] Agent not spawned; %d active runtime job(s).", #status.active_jobs),
+                    {r = 1, g = 0.75, b = 0.3})
+                return
+            end
+            local character = status.character
+            command_print(
+                command,
+                string.format(
+                    "[FactorIA] Agent #%s at (%.1f, %.1f) on %s; %d active runtime job(s).",
+                    tostring(character.unit_number),
+                    character.position.x,
+                    character.position.y,
+                    character.surface,
+                    #status.active_jobs),
+                {r = 0.4, g = 0.85, b = 1})
+            return
+        end
+
+        --if not require_command_admin(command) then
+        --    return
+        --end
+
+        if operation == "spawn" then
+            local existed = stored_agent_character() ~= nil
+            local character = ensure_agent_character()
+            command_print(
+                command,
+                string.format(
+                    "[FactorIA] Agent %s at (%.1f, %.1f) on %s.",
+                    existed and "already active" or "spawned",
+                    character.position.x,
+                    character.position.y,
+                    character.surface.name),
+                {r = 0.3, g = 1, b = 0.5})
+        elseif operation == "remove" then
+            local result = remove_agent_character()
+            command_print(
+                command,
+                string.format(
+                    "[FactorIA] Agent %s; stopped %d runtime job(s), spilled %d item stack(s).",
+                    result.removed and "removed" or "was not active",
+                    result.stopped_jobs,
+                    result.spilled_item_entities),
+                {r = 1, g = 0.65, b = 0.3})
+        elseif operation == "come" then
+            local player = command_player(command)
+            local character = stored_agent_character()
+            if not player then
+                command_print(command, "[FactorIA] 'come' must be run by an in-game player.", {r = 1, g = 0.5, b = 0.3})
+            elseif not character then
+                command_print(command, "[FactorIA] Agent is not spawned.", {r = 1, g = 0.5, b = 0.3})
+            else
+                local destination = position_beside(player.surface, player.position)
+                if not destination then
+                    command_print(command, "[FactorIA] No free position was found beside you.", {r = 1, g = 0.5, b = 0.3})
+                else
+                    local stopped_jobs = stop_all_runtime_jobs()
+                    local moved = character.teleport(destination, player.surface)
+                    command_print(
+                        command,
+                        string.format(
+                            "[FactorIA] Agent %s; stopped %d runtime job(s).",
+                            moved and "moved beside you" or "could not be moved",
+                            stopped_jobs),
+                        moved and {r = 0.3, g = 1, b = 0.5} or {r = 1, g = 0.5, b = 0.3})
+                end
+            end
+        elseif operation == "goto" then
+            local player = command_player(command)
+            local character = stored_agent_character()
+            if not player then
+                command_print(command, "[FactorIA] 'goto' must be run by an in-game player.", {r = 1, g = 0.5, b = 0.3})
+            elseif not character then
+                command_print(command, "[FactorIA] Agent is not spawned.", {r = 1, g = 0.5, b = 0.3})
+            else
+                local destination = position_beside(character.surface, character.position)
+                local moved = destination and player.teleport(destination, character.surface)
+                command_print(
+                    command,
+                    moved and "[FactorIA] Moved beside the agent." or "[FactorIA] No free position was found beside the agent.",
+                    moved and {r = 0.3, g = 1, b = 0.5} or {r = 1, g = 0.5, b = 0.3})
+            end
+        else
+            print_command_help(command)
+        end
+    end)
