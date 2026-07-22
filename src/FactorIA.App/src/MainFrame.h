@@ -1,10 +1,12 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -14,6 +16,7 @@
 #include <FactorIA/AgentController.h>
 #include <FactorIA/LlamaClient.h>
 #include <FactorIA/RconClient.h>
+#include <FactorIA/WebControlServer.h>
 
 class wxButton;
 class wxCheckBox;
@@ -37,6 +40,9 @@ private:
     void UpdateOpenRouterStatusRequest();
     void RunOpenRouterStatusUpdates(std::stop_token stopToken);
     void SetOpenRouterStatus(std::uint64_t revision, const std::string& text);
+    LlamaClient CreateAiClient(const AppSettings& settings);
+    void RecordRequestEvent(LlamaClient::RequestEvent event);
+    void UpdateRequestCounter();
     void UpdateAgentRoundControls();
     void LoadSettingsIntoControls();
     AppSettings ReadSettingsFromControls() const;
@@ -47,20 +53,37 @@ private:
     void TestLlama();
     void FetchOpenRouterModels();
     void RunAgent();
+    void RunAgentTaskUpdates(std::stop_token stopToken);
+    void QueueAgentTask(FactorioAgentTask task);
+    void StartAgentTask(FactorioAgentTask task);
     void StopAgent();
+    void HandleWebControlCommand(WebControlCommand command);
+    void UpdateWebControlState();
+    void SetAgentStatus(const wxString& status);
     void StartWork(
         std::string description,
         std::function<void(std::stop_token)> work,
         bool enableStop = false);
     void FinishWork();
     void SetConnectionState(bool connected, const wxString& detail = {});
+    void PublishModelDecision(FactorioTools& tools, const std::string& decision);
     void AppendModelDecision(const wxString& decision);
     void AppendLog(const wxString& message);
+    std::string ExecuteRconCommand(const std::string& command);
 
     AppSettings settings_;
     std::mutex clientMutex_;
     std::unique_ptr<RconClient> rconClient_;
     std::jthread worker_;
+    bool workActive_{};
+    bool rconConnected_{};
+    std::unique_ptr<WebControlServer> webControlServer_;
+
+    std::mutex agentTaskWaitMutex_;
+    std::condition_variable_any agentTaskChanged_;
+    std::atomic_bool agentTaskDispatchPending_{};
+    std::optional<FactorioAgentTask> pendingAgentTask_;
+    std::jthread agentTaskWorker_;
 
     struct OpenRouterStatusRequest
     {
@@ -73,6 +96,8 @@ private:
     std::condition_variable_any openRouterStatusChanged_;
     OpenRouterStatusRequest openRouterStatusRequest_;
     std::jthread openRouterStatusWorker_;
+    std::atomic<std::uint64_t> requestsSent_{};
+    std::atomic<std::uint64_t> responsesReceived_{};
 
     wxTextCtrl* rconHost_{};
     wxSpinCtrl* rconPort_{};

@@ -17,6 +17,7 @@
 #include <wx/statbox.h>
 #include <wx/stattext.h>
 #include <wx/textctrl.h>
+#include <wx/utils.h>
 
 namespace factoria
 {
@@ -39,13 +40,8 @@ wxString FromPath(const std::filesystem::path& value)
 constexpr const char* OpenRouterUrl = "https://openrouter.ai/api/v1";
 constexpr auto OpenRouterStatusDebounce = std::chrono::seconds(1);
 constexpr auto OpenRouterStatusRefreshInterval = std::chrono::minutes(1);
-
-LlamaClient CreateAiClient(const AppSettings& settings)
-{
-    if (settings.aiProvider == "openrouter")
-        return LlamaClient(OpenRouterUrl, settings.openRouterModel, settings.openRouterApiKey);
-    return LlamaClient(settings.llamaUrl, settings.llamaModel);
-}
+constexpr auto AgentTaskPollInterval = std::chrono::seconds(1);
+constexpr std::uint16_t WebControlPort = 8090;
 
 std::string AiProviderName(const AppSettings& settings)
 {
@@ -109,14 +105,43 @@ MainFrame::MainFrame()
     }
     LoadSettingsIntoControls();
     SetConnectionState(false);
+    webControlServer_ = std::make_unique<WebControlServer>([this](WebControlCommand command) {
+        CallAfter([this, command = std::move(command)]() mutable {
+            HandleWebControlCommand(std::move(command));
+        });
+    });
+    UpdateWebControlState();
+    if (webControlServer_->Start("0.0.0.0", WebControlPort))
+    {
+        auto webHost = wxGetHostName();
+        if (webHost.empty())
+            webHost = "<computer-lan-ip>";
+        AppendLog("Web control is available at http://" + webHost + ":" +
+            wxString::Format("%u", WebControlPort) +
+            " on the local network (use this computer's LAN IP if the hostname does not resolve)");
+    }
+    else
+    {
+        AppendLog("Web control could not listen on port " + wxString::Format("%u", WebControlPort));
+    }
     openRouterStatusWorker_ = std::jthread(
         [this](std::stop_token stopToken) { RunOpenRouterStatusUpdates(stopToken); });
+    agentTaskWorker_ = std::jthread(
+        [this](std::stop_token stopToken) { RunAgentTaskUpdates(stopToken); });
     openRouterStatusChanged_.notify_all();
     Centre();
 }
 
 MainFrame::~MainFrame()
 {
+    if (webControlServer_)
+        webControlServer_->Stop();
+    if (agentTaskWorker_.joinable())
+    {
+        agentTaskWorker_.request_stop();
+        agentTaskChanged_.notify_all();
+        agentTaskWorker_.join();
+    }
     if (openRouterStatusWorker_.joinable())
     {
         openRouterStatusWorker_.request_stop();
@@ -144,11 +169,12 @@ void MainFrame::BuildUi()
     auto* root = new wxBoxSizer(wxVERTICAL);
     root->Add(notebook, 1, wxEXPAND);
     SetSizer(root);
-    CreateStatusBar(2);
-    const int statusWidths[]{-1, -3};
-    SetStatusWidths(2, statusWidths);
+    CreateStatusBar(3);
+    const int statusWidths[]{-1, -3, 215};
+    SetStatusWidths(3, statusWidths);
     SetStatusText("Factorio: Disconnected", 0);
     SetStatusText("AI: not configured", 1);
+    UpdateRequestCounter();
 
     auto* connectionRoot = new wxBoxSizer(wxVERTICAL);
     auto* factorioBox = new wxStaticBoxSizer(wxVERTICAL, connectionPanel, "Factorio RCON");
@@ -177,7 +203,7 @@ void MainFrame::BuildUi()
     rconStatus_ = new wxStaticText(connectionPanel, wxID_ANY, "Disconnected");
     connectButton_ = new wxButton(connectionPanel, wxID_ANY, "Connect");
     disconnectButton_ = new wxButton(connectionPanel, wxID_ANY, "Disconnect");
-    testButton_ = new wxButton(connectionPanel, wxID_ANY, "Read game tick");
+    testButton_ = new wxButton(connectionPanel, wxID_ANY, "Read bridge status");
     stateRow->Add(rconStatus_, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
     stateRow->Add(connectButton_, 0, wxRIGHT, 8);
     stateRow->Add(disconnectButton_, 0, wxRIGHT, 8);
@@ -271,7 +297,12 @@ void MainFrame::BuildUi()
     fetchOpenRouterModelsButton_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { FetchOpenRouterModels(); });
     aiProvider_->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { UpdateAiProviderControls(); });
     openRouterApiKey_->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { UpdateOpenRouterStatusRequest(); });
-    nonStopAgentRun_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { UpdateAgentRoundControls(); });
+    objective_->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { UpdateWebControlState(); });
+    maximumRounds_->Bind(wxEVT_SPINCTRL, [this](wxCommandEvent&) { UpdateWebControlState(); });
+    nonStopAgentRun_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) {
+        UpdateAgentRoundControls();
+        UpdateWebControlState();
+    });
     agentRunButton_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { RunAgent(); });
     agentStopButton_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { StopAgent(); });
     agentRunButton_->Disable();
@@ -366,7 +397,12 @@ void MainFrame::RunOpenRouterStatusUpdates(std::stop_token stopToken)
 
         try
         {
-            const auto usage = LlamaClient(OpenRouterUrl, {}, request.apiKey).GetOpenRouterKeyUsage();
+            const LlamaClient client(
+                OpenRouterUrl,
+                {},
+                request.apiKey,
+                [this](LlamaClient::RequestEvent event) { RecordRequestEvent(event); });
+            const auto usage = client.GetOpenRouterKeyUsage();
             CallAfter([this, revision = request.revision, text = OpenRouterStatusText(usage)] {
                 SetOpenRouterStatus(revision, text);
             });
@@ -398,6 +434,40 @@ void MainFrame::SetOpenRouterStatus(std::uint64_t revision, const std::string& t
             return;
     }
     SetStatusText(FromUtf8(text), 1);
+}
+
+LlamaClient MainFrame::CreateAiClient(const AppSettings& settings)
+{
+    auto requestHandler = [this](LlamaClient::RequestEvent event) { RecordRequestEvent(event); };
+    if (settings.aiProvider == "openrouter")
+    {
+        return LlamaClient(
+            OpenRouterUrl,
+            settings.openRouterModel,
+            settings.openRouterApiKey,
+            std::move(requestHandler));
+    }
+    return LlamaClient(settings.llamaUrl, settings.llamaModel, {}, std::move(requestHandler));
+}
+
+void MainFrame::RecordRequestEvent(LlamaClient::RequestEvent event)
+{
+    if (event == LlamaClient::RequestEvent::Sent)
+        requestsSent_.fetch_add(1, std::memory_order_relaxed);
+    else
+        responsesReceived_.fetch_add(1, std::memory_order_relaxed);
+
+    CallAfter([this] { UpdateRequestCounter(); });
+}
+
+void MainFrame::UpdateRequestCounter()
+{
+    SetStatusText(
+        wxString::Format(
+            "HTTP: %llu sent | %llu received",
+            static_cast<unsigned long long>(requestsSent_.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(responsesReceived_.load(std::memory_order_relaxed))),
+        2);
 }
 
 void MainFrame::UpdateAgentRoundControls()
@@ -454,6 +524,7 @@ void MainFrame::ConnectRcon()
     catch (const std::exception& error)
     {
         AppendLog("Cannot connect: " + FromUtf8(error.what()));
+        UpdateWebControlState();
         return;
     }
 
@@ -486,15 +557,16 @@ void MainFrame::DisconnectRcon()
 
 void MainFrame::TestRcon()
 {
-    StartWork("Reading Factorio game tick", [this](std::stop_token) {
-        std::string response;
-        {
-            std::scoped_lock lock(clientMutex_);
-            if (!rconClient_ || !rconClient_->IsConnected())
-                throw std::runtime_error("Factorio RCON is not connected");
-            response = rconClient_->Execute("/sc rcon.print(\"FACTORIA_OK tick=\" .. game.tick)");
-        }
-        CallAfter([this, response] { AppendLog("Factorio response: " + FromUtf8(response)); });
+    StartWork("Reading FactorIA Bridge status", [this](std::stop_token) {
+        FactorioTools bridge(
+            [this](const std::string& command) { return ExecuteRconCommand(command); },
+            {});
+        const auto status = bridge.GetBridgeStatus();
+        const auto response =
+            "connected; command protocol " + std::to_string(status.at("command_protocol_version").get<int>()) +
+            ", runtime " + std::to_string(status.at("runtime_version").get<int>()) +
+            ", tick " + std::to_string(status.at("tick").get<std::uint64_t>());
+        CallAfter([this, response] { AppendLog("FactorIA Bridge: " + FromUtf8(response)); });
     });
 }
 
@@ -597,30 +669,30 @@ void MainFrame::RunAgent()
     catch (const std::exception& error)
     {
         AppendLog("Cannot run agent: " + FromUtf8(error.what()));
+        UpdateWebControlState();
         return;
     }
 
     agentStatus_->SetLabel("Running");
     StartWork("Running agent objective", [this, requested, objective, maximumRounds](std::stop_token stopToken) {
-        FactorioTools tools([this](const std::string& command) {
-            std::scoped_lock lock(clientMutex_);
-            if (!rconClient_ || !rconClient_->IsConnected())
-                throw std::runtime_error("Factorio RCON disconnected during the agent run");
-            return rconClient_->Execute(command);
-        }, requested.factorioUserDataPath, requested.useDedicatedAiCharacter);
+        FactorioTools tools(
+            [this](const std::string& command) { return ExecuteRconCommand(command); },
+            requested.factorioUserDataPath,
+            requested.useDedicatedAiCharacter);
         AgentController controller(CreateAiClient(requested), tools);
         const auto result = controller.Run(
             objective,
             maximumRounds,
             stopToken,
+            AgentRunMode::LaunchRocket,
             [this](const std::string& trace) {
                 CallAfter([this, text = FromUtf8(trace)] { AppendLog(text); });
             },
-            [this](const std::string& decision) {
-                CallAfter([this, text = FromUtf8(decision)] { AppendModelDecision(text); });
+            [this, &tools](const std::string& decision) {
+                PublishModelDecision(tools, decision);
             });
         CallAfter([this, result] {
-            agentStatus_->SetLabel(result.stopped ? "Stopped" : "Completed");
+            SetAgentStatus(result.stopped ? "Stopped" : "Completed");
             AppendLog(result.stopped
                 ? "Agent stopped after round " + wxString::Format("%d", result.rounds)
                 : "Agent completed after round " + wxString::Format("%d", result.rounds));
@@ -628,14 +700,240 @@ void MainFrame::RunAgent()
     }, true);
 }
 
+void MainFrame::RunAgentTaskUpdates(std::stop_token stopToken)
+{
+    FactorioTools taskBridge(
+        [this](const std::string& command) { return ExecuteRconCommand(command); },
+        {},
+        true);
+    while (!stopToken.stop_requested())
+    {
+        bool connected = false;
+        {
+            std::scoped_lock lock(clientMutex_);
+            connected = rconClient_ && rconClient_->IsConnected();
+        }
+
+        if (connected && !agentTaskDispatchPending_.load())
+        {
+            try
+            {
+                auto task = taskBridge.PeekAgentTask();
+                bool expected = false;
+                if (task && agentTaskDispatchPending_.compare_exchange_strong(expected, true))
+                {
+                    CallAfter([this, task = std::move(*task)]() mutable {
+                        QueueAgentTask(std::move(task));
+                    });
+                }
+            }
+            catch (const std::exception& error)
+            {
+                // A disconnect can race this poll; normal connection UI owns that error state.
+                std::scoped_lock lock(clientMutex_);
+                if (rconClient_ && rconClient_->IsConnected())
+                {
+                    CallAfter([this, message = FromUtf8(error.what())] {
+                        AppendLog("Cannot read in-game agent tasks: " + message);
+                    });
+                }
+            }
+        }
+
+        std::unique_lock lock(agentTaskWaitMutex_);
+        agentTaskChanged_.wait_for(lock, stopToken, AgentTaskPollInterval, [] { return false; });
+    }
+}
+
+void MainFrame::QueueAgentTask(FactorioAgentTask task)
+{
+    pendingAgentTask_ = std::move(task);
+    if (workActive_)
+    {
+        if (worker_.joinable())
+            worker_.request_stop();
+        SetAgentStatus("Switching to in-game task...");
+        AppendLog("In-game task #" + wxString::Format(
+            "%llu", static_cast<unsigned long long>(pendingAgentTask_->id)) +
+            " is waiting for the current operation to stop");
+        return;
+    }
+
+    auto queued = std::move(*pendingAgentTask_);
+    pendingAgentTask_.reset();
+    StartAgentTask(std::move(queued));
+}
+
+void MainFrame::StartAgentTask(FactorioAgentTask task)
+{
+    AppSettings requested;
+    try
+    {
+        requested = ReadSettingsFromControls();
+        ValidateAiSettings(requested);
+        if (task.kind != "build-ghosts" && task.kind != "remove-markers")
+            throw std::runtime_error("Unsupported in-game agent task: " + task.kind);
+    }
+    catch (const std::exception& error)
+    {
+        const auto message = std::string("Desktop configuration error: ") + error.what();
+        SetAgentStatus("Task rejected");
+        StartWork("Rejecting in-game agent task", [this, task = std::move(task), message](std::stop_token) {
+            FactorioTools tools(
+                [this](const std::string& command) { return ExecuteRconCommand(command); },
+                {},
+                true,
+                task);
+            try
+            {
+                tools.FinishAgentTask(task.id, false, message);
+            }
+            catch (...)
+            {
+                agentTaskDispatchPending_.store(false);
+                agentTaskChanged_.notify_all();
+                throw;
+            }
+            agentTaskDispatchPending_.store(false);
+            agentTaskChanged_.notify_all();
+        });
+        return;
+    }
+
+    const auto removeMarkers = task.kind == "remove-markers";
+    const auto mode = removeMarkers ? AgentRunMode::RemoveMarkers : AgentRunMode::BuildGhosts;
+    const auto requestedAction = removeMarkers
+        ? "remove every entity explicitly marked for deconstruction"
+        : "build every entity ghost";
+    const auto objective =
+        "In-game task #" + std::to_string(task.id) + " from player " + task.issuerName +
+        ": " + requestedAction + " within radius " + std::to_string(task.searchRadius) +
+        " of the dedicated FactorIA character. Once none remain, return to the issuing player with "
+        "return_to_task_issuer.";
+    const auto workDescription = "Running in-game " + task.kind + " task #" + std::to_string(task.id);
+    agentStatus_->SetLabel("Running in-game task #" + wxString::Format(
+        "%llu", static_cast<unsigned long long>(task.id)));
+    StartWork(workDescription,
+        [this, requested, task = std::move(task), objective, mode](std::stop_token stopToken) {
+            FactorioTools tools(
+                [this](const std::string& command) { return ExecuteRconCommand(command); },
+                requested.factorioUserDataPath,
+                true,
+                task);
+            if (!tools.ClaimAgentTask(task.id))
+            {
+                agentTaskDispatchPending_.store(false);
+                agentTaskChanged_.notify_all();
+                throw std::runtime_error("In-game agent task could not be claimed");
+            }
+
+            try
+            {
+                AgentController controller(CreateAiClient(requested), tools);
+                const auto result = controller.Run(
+                    objective,
+                    std::nullopt,
+                    stopToken,
+                    mode,
+                    [this](const std::string& trace) {
+                        CallAfter([this, text = FromUtf8(trace)] { AppendLog(text); });
+                    },
+                    [this, &tools](const std::string& decision) {
+                        PublishModelDecision(tools, decision);
+                    });
+                const auto message = result.stopped
+                    ? std::string("Stopped by the desktop user.")
+                    : result.finalText;
+                tools.FinishAgentTask(task.id, result.succeeded, message);
+                agentTaskDispatchPending_.store(false);
+                agentTaskChanged_.notify_all();
+                CallAfter([this, result, taskId = task.id] {
+                    SetAgentStatus(result.stopped
+                        ? "Task stopped"
+                        : result.succeeded ? "Task completed" : "Task failed");
+                    AppendLog("In-game task #" + wxString::Format(
+                        "%llu", static_cast<unsigned long long>(taskId)) +
+                        (result.succeeded ? " completed" : result.stopped ? " stopped" : " failed"));
+                });
+            }
+            catch (const std::exception& error)
+            {
+                try
+                {
+                    tools.FinishAgentTask(task.id, false, error.what());
+                }
+                catch (...)
+                {
+                }
+                agentTaskDispatchPending_.store(false);
+                agentTaskChanged_.notify_all();
+                throw;
+            }
+        },
+        true);
+}
+
 void MainFrame::StopAgent()
 {
-    if (worker_.joinable())
+    if (workActive_ && worker_.joinable())
     {
         worker_.request_stop();
-        agentStatus_->SetLabel("Stopping...");
+        SetAgentStatus("Stopping...");
         AppendLog("Stop requested; an active AI HTTP request must finish before cancellation completes");
     }
+}
+
+void MainFrame::HandleWebControlCommand(WebControlCommand command)
+{
+    if (command.action != WebControlCommand::Action::Stop && workActive_)
+    {
+        AppendLog("Web control action ignored because another operation is already running");
+        UpdateWebControlState();
+        return;
+    }
+
+    switch (command.action)
+    {
+    case WebControlCommand::Action::Connect:
+        ConnectRcon();
+        break;
+    case WebControlCommand::Action::Disconnect:
+        DisconnectRcon();
+        break;
+    case WebControlCommand::Action::Run:
+        objective_->ChangeValue(FromUtf8(command.objective));
+        nonStopAgentRun_->SetValue(!command.maximumRounds.has_value());
+        if (command.maximumRounds)
+            maximumRounds_->SetValue(*command.maximumRounds);
+        UpdateAgentRoundControls();
+        RunAgent();
+        break;
+    case WebControlCommand::Action::Stop:
+        StopAgent();
+        break;
+    }
+}
+
+void MainFrame::UpdateWebControlState()
+{
+    if (!webControlServer_)
+        return;
+
+    webControlServer_->PublishState({
+        .connected = rconConnected_,
+        .busy = workActive_,
+        .agentRunning = agentStopButton_->IsEnabled(),
+        .agentStatus = agentStatus_->GetLabel().ToStdString(),
+        .objective = objective_->GetValue().ToStdString(),
+        .maximumRounds = maximumRounds_->GetValue(),
+        .nonStop = nonStopAgentRun_->GetValue(),
+    });
+}
+
+void MainFrame::SetAgentStatus(const wxString& status)
+{
+    agentStatus_->SetLabel(status);
+    UpdateWebControlState();
 }
 
 void MainFrame::StartWork(
@@ -645,6 +943,7 @@ void MainFrame::StartWork(
 {
     if (worker_.joinable())
         worker_.join();
+    workActive_ = true;
     connectButton_->Disable();
     disconnectButton_->Disable();
     testButton_->Disable();
@@ -653,6 +952,7 @@ void MainFrame::StartWork(
     fetchOpenRouterModelsButton_->Disable();
     agentRunButton_->Disable();
     agentStopButton_->Enable(enableStop);
+    UpdateWebControlState();
     AppendLog(FromUtf8(description) + "...");
     worker_ = std::jthread([this, work = std::move(work)](std::stop_token stopToken) {
         try
@@ -666,9 +966,12 @@ void MainFrame::StartWork(
                 AppendLog("Operation failed: " + message);
                 if (llamaStatus_->GetLabel() == "Testing...")
                     llamaStatus_->SetLabel("Failed");
-                if (agentStatus_->GetLabel() == "Running" || agentStatus_->GetLabel() == "Stopping...")
+                if (agentStatus_->GetLabel() == "Running" ||
+                    agentStatus_->GetLabel() == "Stopping..." ||
+                    agentStatus_->GetLabel().StartsWith("Running in-game task") ||
+                    agentStatus_->GetLabel() == "Switching to in-game task...")
                 {
-                    agentStatus_->SetLabel("Failed");
+                    SetAgentStatus("Failed");
                 }
                 std::scoped_lock lock(clientMutex_);
                 if (!rconClient_ || !rconClient_->IsConnected())
@@ -681,21 +984,33 @@ void MainFrame::StartWork(
 
 void MainFrame::FinishWork()
 {
+    workActive_ = false;
     connectButton_->Enable();
     llamaTestButton_->Enable();
     const auto openRouter = aiProvider_->GetSelection() == 1;
     openRouterFreeModelsOnly_->Enable(openRouter);
     fetchOpenRouterModelsButton_->Enable(openRouter);
     agentStopButton_->Disable();
-    std::scoped_lock lock(clientMutex_);
-    const auto connected = rconClient_ && rconClient_->IsConnected();
+    bool connected = false;
+    {
+        std::scoped_lock lock(clientMutex_);
+        connected = rconClient_ && rconClient_->IsConnected();
+    }
     disconnectButton_->Enable(connected);
     testButton_->Enable(connected);
     agentRunButton_->Enable(connected);
+    UpdateWebControlState();
+    if (pendingAgentTask_)
+    {
+        auto task = std::move(*pendingAgentTask_);
+        pendingAgentTask_.reset();
+        StartAgentTask(std::move(task));
+    }
 }
 
 void MainFrame::SetConnectionState(bool connected, const wxString& detail)
 {
+    rconConnected_ = connected;
     const wxString state = connected ? "Connected" : "Disconnected";
     rconStatus_->SetLabel(detail.empty() ? state : state + " - " + detail);
     SetStatusText("Factorio: " + state, 0);
@@ -703,12 +1018,32 @@ void MainFrame::SetConnectionState(bool connected, const wxString& detail)
     disconnectButton_->Enable(connected);
     testButton_->Enable(connected);
     agentRunButton_->Enable(connected);
+    agentTaskChanged_.notify_all();
+    UpdateWebControlState();
+}
+
+void MainFrame::PublishModelDecision(FactorioTools& tools, const std::string& decision)
+{
+    try
+    {
+        // Publish before tool execution so players can see the agent's next action in advance.
+        tools.PrintModelDecision(decision);
+    }
+    catch (const std::exception& error)
+    {
+        CallAfter([this, message = FromUtf8(error.what())] {
+            AppendLog("Cannot print model decision to game chat: " + message);
+        });
+    }
+    CallAfter([this, text = FromUtf8(decision)] { AppendModelDecision(text); });
 }
 
 void MainFrame::AppendModelDecision(const wxString& decision)
 {
     // Decisions are already normalized by AgentController; keep one entry per line here.
     modelDecisions_->AppendText(decision + "\n");
+    if (webControlServer_)
+        webControlServer_->PublishDecision(decision.ToStdString());
 }
 
 void MainFrame::AppendLog(const wxString& message)
@@ -720,5 +1055,13 @@ void MainFrame::AppendLog(const wxString& message)
     log_->AppendText("[" + timestamp + "] " + indented + "\n");
     if (message.Contains("\n"))
         log_->AppendText("\n");
+}
+
+std::string MainFrame::ExecuteRconCommand(const std::string& command)
+{
+    std::scoped_lock lock(clientMutex_);
+    if (!rconClient_ || !rconClient_->IsConnected())
+        throw std::runtime_error("Factorio RCON is not connected");
+    return rconClient_->Execute(command);
 }
 }

@@ -44,7 +44,7 @@
       <TreatWarningAsError>true</TreatWarningAsError>
       <ConformanceMode>true</ConformanceMode>
       <AdditionalIncludeDirectories>$(ProjectDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>ASIO_STANDALONE;CPPHTTPLIB_OPENSSL_SUPPORT;WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;_WIN32_WINNT=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>ASIO_STANDALONE;CPPHTTPLIB_OPENSSL_SUPPORT;CPPHTTPLIB_WEBSOCKET_READ_TIMEOUT_SECOND=5;WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;_WIN32_WINNT=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -59,6 +59,7 @@
     <ClCompile Include="src\Main.cpp" />
     <ClCompile Include="src\MainFrame.cpp" />
     <ClCompile Include="src\RconClient.cpp" />
+    <ClCompile Include="src\WebControlServer.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\FactorIA\AgentController.h" />
@@ -66,7 +67,7 @@
     <ClInclude Include="include\FactorIA\FactorioTools.h" />
     <ClInclude Include="include\FactorIA\LlamaClient.h" />
     <ClInclude Include="include\FactorIA\RconClient.h" />
-    <ClInclude Include="src\FactorioRuntimeActions.h" />
+    <ClInclude Include="include\FactorIA\WebControlServer.h" />
     <ClInclude Include="src\MainFrame.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

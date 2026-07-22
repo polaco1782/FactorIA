@@ -24,6 +24,7 @@ The initial application shell provides:
 - collision-aware `walk_to` routing and tick-synchronized walking and mining through the bundled FactorIA Bridge mod;
 - optional persistent AI-owned character control, keeping the human player's character and inventory separate;
 - an Agent tab for objectives, execution limits up to 999 rounds, optional non-stop execution, final output, and full tool tracing;
+- a mobile-friendly local web panel with real-time WebSocket status and model decisions plus run, stop, connect, and disconnect controls;
 - a structured, timestamped application log containing redacted model requests, provider responses, decision summaries, tool calls, and tool results.
 
 ## Requirements
@@ -61,6 +62,17 @@ the server non-interactively through a service manager.
 
 Settings are stored in the platform-specific user configuration directory under `FactorIA/settings.json`.
 
+### Mobile web control
+
+FactorIA starts an embedded HTTP server on port `8090`. From a phone on the same network, open
+`http://<computer-lan-ip>:8090/` to send an objective, choose bounded or non-stop execution, stop the agent,
+connect or disconnect Factorio, and watch the compact model-decision feed update over WebSocket in real time.
+The desktop log reports whether the listener started successfully.
+
+The panel exposes no provider key, RCON password, raw model request, or tool trace. It currently uses plain HTTP
+without authentication and listens on all network interfaces, so expose port `8090` only on a trusted LAN or
+restrict it with the host firewall.
+
 ## FactorIA Bridge mod
 
 For collision-aware navigation and smooth continuous mining, copy the bundled
@@ -70,9 +82,11 @@ mod is required for walking and mining; FactorIA no longer falls back to rapid R
 
 The mod requests paths using the active character's real collision box and collision mask, so water, cliffs,
 buildings, and other impassable terrain are considered by Factorio rather than inferred by the language model.
-FactorIA uploads its trusted player-control action module over RCON in small chunks and the mod executes active
-actions on every game tick. Uploaded functions are session-local and are automatically uploaded again after a
-save load or mod reload. Only typed, validated tools are exposed to the model; model-generated Lua is never run.
+Gameplay behavior lives in the bundled Lua mod: it owns observations, construction, movement, mining, crafting,
+placement, inventory transfers, and storage-backed tick jobs. The C++ application validates typed model calls,
+forwards JSON requests to the mod's `/factoria-bridge` RCON command, waits or cancels when needed, and returns the
+bridge result to the AI provider. The C++ application never constructs or executes Lua; model-generated Lua is
+never run, and no gameplay module is uploaded over RCON.
 
 The bridge also records completed typed crafting, building, and mining actions for trigger-based technologies.
 This is required for the dedicated AI character because it is not attached to a `LuaPlayer` and therefore does
@@ -87,11 +101,13 @@ must gather its own resources.
 
 ### In-game agent commands
 
-The bridge mod provides one namespaced console command for inspecting and recovering the dedicated character:
+The bridge mod provides one player-facing console command for inspecting and recovering the dedicated character:
 
 ```text
 /factoria-agent status
 /factoria-agent spawn
+/factoria-agent build-ghosts
+/factoria-agent remove-markers
 /factoria-agent come
 /factoria-agent goto
 /factoria-agent remove
@@ -102,6 +118,15 @@ require administrator permission when invoked by a player. `come` moves the agen
 stops active bridge runtime jobs first; `goto` moves the invoking player beside the agent. `remove` spills the
 agent's inventories at its position before removing it. The desktop agent can start another action after `come`
 or `remove`, so stop the run in FactorIA first when performing manual recovery.
+
+`build-ghosts` and `remove-markers` queue persistent tasks for the connected desktop application. Each switches the
+model to a focused prompt: `build-ghosts` services entity ghosts, while `remove-markers` locates and mines only
+entities explicitly marked for deconstruction. Both operate within 64 tiles of the dedicated character and prevent
+unrelated factory expansion or rocket work. When no matching requests remain, the agent walks normally back to the
+player who issued the command; the return tool tracks that player's current position and rechecks the task before
+reporting success. The desktop checks for commands once per second without spending model tokens, interrupts a
+general agent run when a task arrives, and resumes a claimed task after a desktop restart. Keep FactorIA connected
+to RCON with a working AI provider configuration for queued tasks to run.
 
 ## Screenshot tool
 

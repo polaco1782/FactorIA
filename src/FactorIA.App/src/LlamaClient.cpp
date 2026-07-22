@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 #include <httplib.h>
 
@@ -19,6 +20,19 @@ using json = nlohmann::json;
 
 constexpr int MaximumCompletionAttempts = 5;
 constexpr auto ModelResponseTimeout = std::chrono::seconds(60);
+
+template <typename Request>
+httplib::Result SendTrackedRequest(const LlamaClient::RequestHandler& handler, Request&& request)
+{
+    if (handler)
+        handler(LlamaClient::RequestEvent::Sent);
+
+    auto response = std::invoke(std::forward<Request>(request));
+    // Transport failures have no response and intentionally leave the two counters different.
+    if (response && handler)
+        handler(LlamaClient::RequestEvent::ResponseReceived);
+    return response;
+}
 
 httplib::Client CreateCompletionConnection(const std::string& origin)
 {
@@ -281,10 +295,15 @@ void TraceModelResponse(const LlamaClient::TraceHandler& trace, const json& body
 }
 }
 
-LlamaClient::LlamaClient(std::string baseUrl, std::string model, std::string bearerToken)
+LlamaClient::LlamaClient(
+    std::string baseUrl,
+    std::string model,
+    std::string bearerToken,
+    RequestHandler requestHandler)
     : endpoint_(ParseEndpoint(baseUrl)),
       model_(model.empty() ? "local-model" : std::move(model)),
-      bearerToken_(std::move(bearerToken))
+      bearerToken_(std::move(bearerToken)),
+      requestHandler_(std::move(requestHandler))
 {
 }
 
@@ -299,7 +318,7 @@ void LlamaClient::CheckHealth() const
     httplib::Client client(endpoint_.origin);
     client.set_connection_timeout(std::chrono::seconds(5));
     client.set_read_timeout(std::chrono::seconds(10));
-    const auto response = client.Get("/health");
+    const auto response = SendTrackedRequest(requestHandler_, [&client] { return client.Get("/health"); });
     const auto body = ParseJsonBody(response, "llama.cpp health check");
     if (body.value("status", std::string{}) != "ok")
         throw std::runtime_error("llama.cpp is reachable but the model is not ready");
@@ -313,7 +332,9 @@ OpenRouterKeyUsage LlamaClient::GetOpenRouterKeyUsage() const
     httplib::Client client(endpoint_.origin);
     client.set_connection_timeout(std::chrono::seconds(5));
     client.set_read_timeout(std::chrono::seconds(10));
-    const auto response = client.Get(KeyPath(), OpenRouterHeaders(bearerToken_));
+    const auto response = SendTrackedRequest(requestHandler_, [this, &client] {
+        return client.Get(KeyPath(), OpenRouterHeaders(bearerToken_));
+    });
     const auto body = ParseJsonBody(response, "OpenRouter API key usage");
     ThrowIfProviderError(body);
     const auto key = body.find("data");
@@ -446,9 +467,11 @@ LlamaTurn LlamaClient::Complete(
     {
         auto client = CreateCompletionConnection(endpoint_.origin);
         const auto requestStartedAt = std::chrono::steady_clock::now();
-        const auto response = IsOpenRouter()
-            ? client.Post(ChatPath(), OpenRouterHeaders(bearerToken_), requestBody, "application/json")
-            : client.Post(ChatPath(), requestBody, "application/json");
+        const auto response = SendTrackedRequest(requestHandler_, [this, &client, &requestBody] {
+            return IsOpenRouter()
+                ? client.Post(ChatPath(), OpenRouterHeaders(bearerToken_), requestBody, "application/json")
+                : client.Post(ChatPath(), requestBody, "application/json");
+        });
         const auto responseWait = std::chrono::steady_clock::now() - requestStartedAt;
         const auto responseTimedOut = !response && responseWait >= ModelResponseTimeout;
 
@@ -609,7 +632,9 @@ nlohmann::json LlamaClient::ModelCatalog() const
     httplib::Client client(endpoint_.origin);
     client.set_connection_timeout(std::chrono::seconds(10));
     client.set_read_timeout(std::chrono::seconds(30));
-    const auto response = client.Get(ModelsPath(), OpenRouterHeaders(bearerToken_));
+    const auto response = SendTrackedRequest(requestHandler_, [this, &client] {
+        return client.Get(ModelsPath(), OpenRouterHeaders(bearerToken_));
+    });
     auto body = ParseJsonBody(response, "OpenRouter model catalog");
     ThrowIfProviderError(body);
     return body;

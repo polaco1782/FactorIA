@@ -44,9 +44,20 @@ struct OpenRouterKeyUsage
 class LlamaClient
 {
 public:
-    using TraceHandler = std::function<void(const std::string&)>;
+    enum class RequestEvent
+    {
+        Sent,
+        ResponseReceived,
+    };
 
-    LlamaClient(std::string baseUrl, std::string model, std::string bearerToken = {});
+    using TraceHandler = std::function<void(const std::string&)>;
+    using RequestHandler = std::function<void(RequestEvent)>;
+
+    LlamaClient(
+        std::string baseUrl,
+        std::string model,
+        std::string bearerToken = {},
+        RequestHandler requestHandler = {});
 
     void CheckHealth() const;
     [[nodiscard]] std::vector<std::string> ListToolModels(bool freeOnly = false) const;
@@ -74,5 +85,6 @@ private:
     Endpoint endpoint_;
     std::string model_;
     std::string bearerToken_;
+    RequestHandler requestHandler_;
 };
 }

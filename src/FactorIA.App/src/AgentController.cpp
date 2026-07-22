@@ -16,6 +16,7 @@ namespace
 using json = nlohmann::json;
 
 constexpr int MaximumConsecutiveInvalidTerminalTurns = 3;
+constexpr int MaximumConsecutiveIdenticalFailedToolCalls = 3;
 constexpr int MaximumCompactionAttempts = 3;
 constexpr std::size_t LocalPromptTokenCompactionThreshold = 12000;
 constexpr std::size_t MinimumReservedContextTokens = 4096;
@@ -69,28 +70,7 @@ std::string SelectedToolsSummary(const std::vector<LlamaToolCall>& toolCalls)
     return summary;
 }
 
-/*
-constexpr const char* SystemPrompt = R"(You are an autonomous Factorio player controlling one character through typed tools. Your only terminal objective is to launch a rocket.
-Interact with the game exclusively through real calls to the provided tool-calling interface.
-Until a tool result explicitly confirms that a rocket was launched, every response must contain at least one real tool call. Never return a plan, summary, explanation, table, JSON command, plain-text answer, or merely the name or description of a tool instead of invoking it. After a tool explicitly confirms the launch, stop and return only a concise final confirmation.
-After every tool result, immediately choose and invoke the next tool. Continue acting indefinitely across turns; observation, inventory inspection, planning, and intermediate milestones are never completion.
-Treat tool definitions as the authoritative description of available actions and their arguments.
-Use specialized state and discovery tools before acting on unknown information. Do not guess names, coordinates, inventory contents, reachability, or crafting availability.
-Water is terrain rather than an entity or resource. Locate it with find_water, and do not infer that the map is waterless from entity searches or a limited terrain survey.
-Use exact identifiers and positions from the most recent tool results, and satisfy an action's stated preconditions before calling it.
-Before placing a distant or terrain-sensitive entity, use walk_to_for_placement with the exact same item, position, and direction, then call place_entity only when placement_ready is true.
-Advance through the smallest currently available milestone. Do not scale production for the final objective until the immediate prerequisite works.
-Perform a reported research trigger only once, then recheck it. If the same trigger remains incomplete with no changed progress, do not craft or place duplicate trigger items; invoke a genuinely different diagnostic tool.
-Take one meaningful gameplay action at a time, then inspect its result. Use batch counts when a tool supports them instead of repeating the same action one unit at a time.
-Treat partial results and reported failure conditions as new observations: adapt the next action instead of blindly retrying.
-Avoid redundant polling and broad unfiltered queries. Use filters and pagination, and prefer a tool that waits for completion when one is available.
-Prioritize survival, power, resources, automation, science, defense, and rocket production. If uncertain, call the most relevant observation tool. If an action fails, inspect the state and try another valid action.
-Factorio map X increases east and map Y increases south.
-Do not request teleportation, item spawning, raw Lua, or other cheats.
-Your next response must be a tool call.)";
-*/
-
-constexpr const char* SystemPrompt = R"(You are an autonomous Factorio player controlling one character through typed tools. Your only terminal objective is to launch a rocket.
+constexpr const char* RocketSystemPrompt = R"(You are an autonomous Factorio player controlling one character through typed tools. Your only terminal objective is to launch a rocket.
 Interact with the game exclusively through real calls to the provided tool-calling interface. Until a tool result explicitly confirms that a rocket was launched, every response must contain at least one real tool call. Never return a plan, summary, explanation, table, JSON command, plain-text answer, or merely the name or description of a tool instead of invoking it. After a tool explicitly confirms the launch, stop and return only a concise final confirmation.
 After every tool result, immediately choose and invoke the next tool. Continue acting indefinitely across turns; observation, inventory inspection, planning, and intermediate milestones are never completion.
 Treat tool definitions as the authoritative description of available actions and their arguments. Use specialized state and discovery tools before acting on unknown information. Do not guess names, coordinates, inventory contents, reachability, or crafting availability.
@@ -110,15 +90,54 @@ Advance through the smallest currently available milestone. Do not scale product
 Perform a reported research trigger only once, then recheck it. If the same trigger remains incomplete with no changed progress, do not craft or place duplicate trigger items; invoke a genuinely different diagnostic tool.
 Take one meaningful gameplay action at a time, then inspect its result. Use batch counts when a tool supports them instead of repeating the same action one unit at a time.
 Treat partial results and reported failure conditions as new observations: adapt the next action instead of blindly retrying.
-Avoid redundant polling and broad unfiltered queries. Use filters and pagination, and prefer a tool that waits for completion when one is available.
+Avoid redundant polling and broad unfiltered queries. Use filters and pagination, and prefer a tool that waits for completion when one is available. While lab research is active, call wait_for_research once; never poll get_research_status across model turns.
 Prioritize survival, power, resources, automation, science, defense, and rocket production. If uncertain, call the most relevant observation tool. If an action fails, inspect the state and try another valid action.
 Be proactive! Avoid just waiting - explore, gather, build, craft. Always have something to do. If nothing is nearby, MOVE to explore. If you have materials, CRAFT or PLACE. WAIT only when enemies are near or you're in danger.
 Factorio map X increases east and map Y increases south.
 Do not request teleportation, item spawning, raw Lua, or other cheats.
 Your next response must be a tool call.)";
 
+constexpr const char* BuildGhostsSystemPrompt = R"(You are a focused Factorio construction assistant controlling the dedicated FactorIA character through typed tools. Your only objective is to build the nearby entity ghosts requested by the in-game player, then return to that player.
+Interact with the game exclusively through real calls to the provided tool-calling interface. Every response must contain at least one real tool call until return_to_task_issuer reports task_terminal=true. Never return a plan, summary, explanation, JSON command, plain-text answer, or merely a tool name instead of invoking it.
+Begin by calling get_construction_requests with kind="build" and the exact search radius in the objective. Use build_ghosts to service requests in useful bounded batches, then inspect the construction requests again.
+Care only about this construction task. Do not deconstruct anything, pursue research, expand the factory, explore, fight except for immediate survival, or work toward a rocket. You may gather and craft only the materials required to produce an exact missing construction item, and only in quantities needed for the ghosts.
+Use exact identifiers and positions from current tool results. Do not guess names, coordinates, inventory contents, recipes, or availability. Treat partial results and failures as observations and change the next action instead of blindly retrying.
+If the construction scan finds no entity ghosts, or after all nearby ghosts have been built, immediately invoke return_to_task_issuer. That tool tracks the issuing player's current position and will refuse to finish while ghosts remain. Do not wander or search unrelated areas when the scan is empty.
+Use batch counts when supported and avoid redundant polling. Factorio map X increases east and map Y increases south. Do not request teleportation, item spawning, raw Lua, or other cheats.
+Your next response must be a tool call.)";
+
+constexpr const char* RemoveMarkersSystemPrompt = R"(You are a focused Factorio deconstruction assistant controlling the dedicated FactorIA character through typed tools. Your only objective is to locate and remove every nearby entity explicitly marked for deconstruction by the in-game player, then return to that player.
+Interact with the game exclusively through real calls to the provided tool-calling interface. Every response must contain at least one real tool call until return_to_task_issuer reports task_terminal=true. Never return a plan, summary, explanation, JSON command, plain-text answer, or merely the name of a tool instead of invoking it.
+Begin by calling get_construction_requests with kind="deconstruct" and the exact search radius in the objective. Use deconstruct_marked to remove requests in useful bounded batches, then inspect the deconstruction requests again.
+Care only about this deconstruction task. Never mine an entity unless it is explicitly reported as marked for deconstruction. Do not build ghosts, gather resources, craft, pursue research, expand the factory, explore, fight except for immediate survival, or work toward a rocket.
+Use exact identifiers and positions from current tool results. Treat partial results and failures as observations and change the next action instead of blindly retrying.
+If the scan finds no deconstruction-marked entities, or after all matching entities have been removed, immediately invoke return_to_task_issuer. That tool tracks the issuing player's current position and will refuse to finish while deconstruction requests remain. Do not wander or search unrelated areas when the scan is empty.
+Use batch counts when supported and avoid redundant polling. Factorio map X increases east and Y increases south. Do not request teleportation, item spawning, raw Lua, or other cheats.
+Your next response must be a tool call.)";
+
 constexpr const char* CompactionSystemPrompt = R"(You are performing an internal context-compaction task, not a Factorio gameplay turn.
 Do not call tools. Return only the requested concise plain-text progress summary so a gameplay agent can continue from it.)";
+
+const char* SystemPrompt(AgentRunMode mode)
+{
+    switch (mode)
+    {
+    case AgentRunMode::BuildGhosts:
+        return BuildGhostsSystemPrompt;
+    case AgentRunMode::RemoveMarkers:
+        return RemoveMarkersSystemPrompt;
+    case AgentRunMode::LaunchRocket:
+        return RocketSystemPrompt;
+    }
+    return RocketSystemPrompt;
+}
+
+const char* RequiredTerminalEvidence(AgentRunMode mode)
+{
+    return mode != AgentRunMode::LaunchRocket
+        ? "return_to_task_issuer reporting task_terminal=true"
+        : "a tool result explicitly confirming a rocket launch";
+}
 }
 
 AgentController::AgentController(LlamaClient llama, FactorioTools& tools)
@@ -130,6 +149,7 @@ AgentRunResult AgentController::Run(
     const std::string& objective,
     std::optional<int> maximumRounds,
     std::stop_token stopToken,
+    AgentRunMode mode,
     const TraceHandler& trace,
     const DecisionHandler& decision) const
 {
@@ -142,7 +162,7 @@ AgentRunResult AgentController::Run(
     }
 
     json messages = json::array({
-        {{"role", "system"}, {"content", SystemPrompt}},
+        {{"role", "system"}, {"content", SystemPrompt(mode)}},
         {{"role", "user"}, {"content", objective}},
     });
 
@@ -172,7 +192,9 @@ AgentRunResult AgentController::Run(
 
     AgentRunResult result;
     int consecutiveInvalidTerminalTurns = 0;
-    bool rocketLaunchConfirmed = false;
+    int consecutiveIdenticalFailedToolCalls = 0;
+    std::string lastFailedToolCallSignature;
+    bool terminalReached = false;
     for (int round = 1; !maximumRounds || round <= *maximumRounds; ++round)
     {
         if (stopToken.stop_requested())
@@ -210,20 +232,22 @@ AgentRunResult AgentController::Run(
             {
                 throw std::runtime_error("AI model returned " +
                     std::to_string(MaximumConsecutiveInvalidTerminalTurns) +
-                    " consecutive responses without the required tool call before rocket launch confirmation");
+                    " consecutive responses without a required tool call before " +
+                    RequiredTerminalEvidence(mode));
             }
             if (trace)
             {
                 trace("[MODEL RETRY] " + std::string(turn.content.empty() ? "Empty" : "Terminal") +
-                    " response before rocket launch confirmation" +
+                    " response before " + RequiredTerminalEvidence(mode) +
                     (turn.finishReason.empty() ? std::string{} : " (finish: " + turn.finishReason + ")") +
                     "; requiring a tool call (" + std::to_string(consecutiveInvalidTerminalTurns) + " of " +
                     std::to_string(MaximumConsecutiveInvalidTerminalTurns - 1) + ")");
             }
             messages.push_back({
                 {"role", "user"},
-                {"content", "No tool result has explicitly confirmed a rocket launch. Plain-text terminal "
-                    "responses are not allowed. Invoke the next real gameplay or observation tool now."},
+                {"content", "The required terminal evidence is still missing: " +
+                    std::string(RequiredTerminalEvidence(mode)) + ". Plain-text terminal responses are not "
+                    "allowed. Invoke the next real gameplay or observation tool now."},
             });
             continue;
         }
@@ -231,6 +255,8 @@ AgentRunResult AgentController::Run(
         consecutiveInvalidTerminalTurns = 0;
 
         std::vector<std::string> imageDataUrls;
+        bool repeatedFailedToolCallNeedsCorrection = false;
+        std::string repeatedFailedToolCallError;
         for (const auto& call : turn.toolCalls)
         {
             if (stopToken.stop_requested())
@@ -273,10 +299,58 @@ AgentRunResult AgentController::Run(
             {
                 trace("[TOOL RESULT] " + call.name + "\n" + toolResult.dump(2));
             }
-            if (toolResult.value("ok", false) && toolResult["result"].is_object() &&
-                toolResult["result"].value("rocket_launch_confirmed", false))
+            if (!toolResult.value("ok", false))
             {
-                rocketLaunchConfirmed = true;
+                const auto signature = call.name + "\n" + call.arguments.dump();
+                if (signature == lastFailedToolCallSignature)
+                {
+                    ++consecutiveIdenticalFailedToolCalls;
+                }
+                else
+                {
+                    lastFailedToolCallSignature = signature;
+                    consecutiveIdenticalFailedToolCalls = 1;
+                }
+
+                repeatedFailedToolCallNeedsCorrection = consecutiveIdenticalFailedToolCalls >= 2;
+                if (consecutiveIdenticalFailedToolCalls >= MaximumConsecutiveIdenticalFailedToolCalls)
+                {
+                    repeatedFailedToolCallError = "AI model repeated the identical failed tool call " +
+                        call.name + " " + std::to_string(consecutiveIdenticalFailedToolCalls) +
+                        " consecutive times: " + toolResult.value("error", "unknown tool error");
+                }
+            }
+            else
+            {
+                consecutiveIdenticalFailedToolCalls = 0;
+                lastFailedToolCallSignature.clear();
+                repeatedFailedToolCallNeedsCorrection = false;
+                repeatedFailedToolCallError.clear();
+            }
+            if (toolResult.value("ok", false) && toolResult["result"].is_object())
+            {
+                const auto& gameResult = toolResult["result"];
+                if (mode == AgentRunMode::LaunchRocket && gameResult.value("rocket_launch_confirmed", false))
+                {
+                    terminalReached = true;
+                    result.succeeded = true;
+                    result.finalText = "Rocket launch confirmed by the game state.";
+                }
+                else if (mode != AgentRunMode::LaunchRocket && gameResult.value("task_terminal", false))
+                {
+                    terminalReached = true;
+                    result.succeeded = gameResult.value("task_completed", false);
+                    auto defaultMessage = std::string("The in-game task could not return to the issuer.");
+                    if (result.succeeded)
+                    {
+                        defaultMessage = mode == AgentRunMode::BuildGhosts
+                            ? "Ghost construction task completed and the agent returned to the issuer."
+                            : "Deconstruction task completed and the agent returned to the issuer.";
+                    }
+                    result.finalText = gameResult.value(
+                        "message",
+                        defaultMessage);
+                }
             }
             messages.push_back({
                 {"role", "tool"},
@@ -296,11 +370,23 @@ AgentRunResult AgentController::Run(
                 })},
             });
         }
-        if (rocketLaunchConfirmed)
+        if (!repeatedFailedToolCallError.empty())
         {
-            result.finalText = "Rocket launch confirmed by the game state.";
-            return result;
+            if (trace)
+                trace("[AGENT LOOP GUARD] " + repeatedFailedToolCallError);
+            throw std::runtime_error(repeatedFailedToolCallError);
         }
+        if (repeatedFailedToolCallNeedsCorrection)
+        {
+            messages.push_back({
+                {"role", "user"},
+                {"content", "You repeated the immediately preceding failed tool call unchanged. The failure "
+                    "result is authoritative. Do not invoke that same call again; correct its arguments from "
+                    "the provided schema or choose a different applicable tool."},
+            });
+        }
+        if (terminalReached)
+            return result;
 
         const auto estimatedPromptTokens = turn.promptTokens == 0
             ? EstimatePromptTokens(messages, toolDefinitions)

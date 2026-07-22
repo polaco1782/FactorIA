@@ -15,6 +15,14 @@ struct AgentRunResult
     std::string finalText;
     int rounds{};
     bool stopped{};
+    bool succeeded{};
+};
+
+enum class AgentRunMode
+{
+    LaunchRocket,
+    BuildGhosts,
+    RemoveMarkers,
 };
 
 class AgentController
@@ -31,6 +39,7 @@ public:
         const std::string& objective,
         std::optional<int> maximumRounds,
         std::stop_token stopToken,
+        AgentRunMode mode,
         const TraceHandler& trace = {},
         const DecisionHandler& decision = {}) const;
 

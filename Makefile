@@ -24,7 +24,8 @@ SOURCES := \
     $(SRC_DIR)/LlamaClient.cpp \
     $(SRC_DIR)/Main.cpp \
     $(SRC_DIR)/MainFrame.cpp \
-    $(SRC_DIR)/RconClient.cpp
+    $(SRC_DIR)/RconClient.cpp \
+    $(SRC_DIR)/WebControlServer.cpp
 
 OBJECTS := $(SOURCES:$(SRC_DIR)/%.cpp=$(BUILD_DIR)/%.o)
 DEPS := $(OBJECTS:.o=.d)
@@ -32,7 +33,8 @@ VCPKG_PREFIX := $(VCPKG_INSTALLED_DIR)/$(VCPKG_TRIPLET)
 
 WARNINGS := -Wall -Wextra -Wformat=2 -Wunused-function
 CPPFLAGS += -I$(INCLUDE_DIR) -I$(VCPKG_PREFIX)/include \
-    -DASIO_STANDALONE -DCPPHTTPLIB_OPENSSL_SUPPORT
+    -DASIO_STANDALONE -DCPPHTTPLIB_OPENSSL_SUPPORT \
+    -DCPPHTTPLIB_WEBSOCKET_READ_TIMEOUT_SECOND=5
 CXXFLAGS += -std=c++20 $(WARNINGS) -MMD -MP -pthread
 
 ifeq ($(BUILD),release)

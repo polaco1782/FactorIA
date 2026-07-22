@@ -12,6 +12,7 @@
     <ClCompile Include="src\Main.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\MainFrame.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\RconClient.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\WebControlServer.cpp"><Filter>Source Files</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\FactorIA\AgentController.h"><Filter>Header Files</Filter></ClInclude>
@@ -19,7 +20,7 @@
     <ClInclude Include="include\FactorIA\FactorioTools.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="include\FactorIA\LlamaClient.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="include\FactorIA\RconClient.h"><Filter>Header Files</Filter></ClInclude>
-    <ClInclude Include="src\FactorioRuntimeActions.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="include\FactorIA\WebControlServer.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\MainFrame.h"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>
 </Project>

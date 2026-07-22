@@ -1,17 +1,21 @@
 local interface_name = "factoria_bridge"
-local runtime_version = 2
+local runtime_version = 3
+local command_protocol_version = 1
 local result_lifetime_ticks = 60 * 60
-
--- Uploaded actions are intentionally session-local because functions cannot be serialized in storage.
-local runtime_actions = {}
-local runtime_uploads = {}
-local runtime_jobs = {}
-local runtime_results = {}
-local next_job_id = 1
+local agent_task_search_radius = 64
+local player_control = require("player_control")
+local construction = require("construction")
+local inspection = require("entity_inspection")
+local gameplay = require("gameplay")
+local placement = require("placement")
 
 local function ensure_storage()
     storage.path_results = storage.path_results or {}
     storage.research_trigger_progress = storage.research_trigger_progress or {}
+    storage.runtime_jobs = storage.runtime_jobs or {}
+    storage.runtime_results = storage.runtime_results or {}
+    storage.next_runtime_job_id = storage.next_runtime_job_id or 1
+    storage.next_agent_task_id = storage.next_agent_task_id or 1
 end
 
 local function stored_agent_character()
@@ -203,22 +207,23 @@ local function record_research_trigger_action(
 end
 
 local function stop_job_control(job)
-    if job.action.stop then
-        pcall(job.action.stop, job.state)
+    if player_control.stop then
+        pcall(player_control.stop, job.state)
     end
 end
 
 local function stop_all_runtime_jobs()
     local job_ids = {}
-    for job_id in pairs(runtime_jobs) do
+    ensure_storage()
+    for job_id in pairs(storage.runtime_jobs) do
         job_ids[#job_ids + 1] = job_id
     end
     table.sort(job_ids)
 
     for _, job_id in ipairs(job_ids) do
-        stop_job_control(runtime_jobs[job_id])
-        runtime_jobs[job_id] = nil
-        runtime_results[job_id] = nil
+        stop_job_control(storage.runtime_jobs[job_id])
+        storage.runtime_jobs[job_id] = nil
+        storage.runtime_results[job_id] = nil
     end
     return #job_ids
 end
@@ -255,25 +260,125 @@ local function remove_agent_character()
     }
 end
 
+local function agent_task_snapshot(task)
+    if not task then
+        return nil
+    end
+    return {
+        id = task.id,
+        kind = task.kind,
+        status = task.status,
+        issuer_player_index = task.issuer_player_index,
+        issuer_name = task.issuer_name,
+        issuer_position = task.issuer_position,
+        issuer_surface = task.issuer_surface,
+        search_radius = task.search_radius,
+        issued_tick = task.issued_tick,
+        started_tick = task.started_tick,
+        resumed_tick = task.resumed_tick
+    }
+end
+
+local function claim_agent_task(task_id)
+    ensure_storage()
+    local task = storage.agent_task
+    if not task or task.id ~= task_id then
+        return {claimed = false, reason = "task_missing"}
+    end
+    if task.status ~= "queued" and task.status ~= "running" then
+        return {claimed = false, reason = "task_not_claimable", status = task.status}
+    end
+
+    local resumed = task.status == "running"
+    task.status = "running"
+    task.started_tick = task.started_tick or game.tick
+    task.resumed_tick = resumed and game.tick or nil
+    return {claimed = true, resumed = resumed, task = agent_task_snapshot(task)}
+end
+
+local function finish_agent_task(task_id, succeeded, message)
+    ensure_storage()
+    local task = storage.agent_task
+    if not task or task.id ~= task_id then
+        return {finished = false, reason = "task_missing"}
+    end
+
+    local clean_message = tostring(message or ""):gsub("[\r\n]+", " "):sub(1, 300)
+    local prefix = succeeded and "completed" or "failed"
+    local text = string.format("[FactorIA] Task #%d %s", task.id, prefix)
+    if clean_message ~= "" then
+        text = text .. ": " .. clean_message
+    end
+    local issuer = game.get_player(task.issuer_player_index)
+    local color = succeeded and {r = 0.3, g = 1, b = 0.5} or {r = 1, g = 0.5, b = 0.3}
+    if issuer then
+        issuer.print(text, {color = color})
+    else
+        game.print(text, {color = color})
+    end
+    storage.agent_task = nil
+    return {finished = true, succeeded = succeeded}
+end
+
+local function print_model_decision(decision)
+    local clean_decision = tostring(decision or ""):gsub("[\r\n]+", " "):sub(1, 300)
+    if clean_decision == "" then
+        return {printed = false, reason = "empty_decision"}
+    end
+
+    game.print("[FactorIA] " .. clean_decision, {color = {r = 0.4, g = 0.8, b = 1}})
+    return {printed = true}
+end
+
+local function agent_task_return_target(task_id)
+    ensure_storage()
+    local task = storage.agent_task
+    if not task or task.id ~= task_id or task.status ~= "running" then
+        return {available = false, reason = "task_not_active"}
+    end
+
+    local issuer = game.get_player(task.issuer_player_index)
+    if not issuer or not issuer.valid or not issuer.character or not issuer.character.valid then
+        return {available = false, reason = "issuer_unavailable"}
+    end
+    local character = stored_agent_character()
+    if not character then
+        return {available = false, reason = "agent_not_spawned"}
+    end
+
+    local same_surface = character.surface == issuer.surface
+    local result = {
+        available = true,
+        task_kind = task.kind,
+        issuer_name = issuer.name,
+        issuer_connected = issuer.connected,
+        position = {x = issuer.position.x, y = issuer.position.y},
+        surface = issuer.surface.name,
+        same_surface = same_surface
+    }
+    if same_surface then
+        local dx = character.position.x - issuer.position.x
+        local dy = character.position.y - issuer.position.y
+        result.distance_to_agent = math.sqrt(dx * dx + dy * dy)
+    end
+    return result
+end
+
 local function agent_status()
     local character = stored_agent_character()
     local jobs = {}
-    for job_id, job in pairs(runtime_jobs) do
+    ensure_storage()
+    for job_id, job in pairs(storage.runtime_jobs) do
         jobs[#jobs + 1] = {id = job_id, action = job.action_name or "unknown"}
     end
     table.sort(jobs, function(left, right) return left.id < right.id end)
 
-    local installed_actions = {}
-    for action_name in pairs(runtime_actions) do
-        installed_actions[#installed_actions + 1] = action_name
-    end
-    table.sort(installed_actions)
-
     local result = {
         spawned = character ~= nil,
         active_jobs = jobs,
-        installed_actions = installed_actions,
-        runtime_version = runtime_version
+        installed_actions = {"player_control"},
+        runtime_version = runtime_version,
+        task = agent_task_snapshot(storage.agent_task)
     }
     if character then
         result.character = {
@@ -287,46 +392,17 @@ local function agent_status()
 end
 
 local function finish_job(job_id, result)
-    local job = runtime_jobs[job_id]
+    ensure_storage()
+    local job = storage.runtime_jobs[job_id]
     if not job then
         return
     end
 
-    runtime_jobs[job_id] = nil
-    runtime_results[job_id] = {
+    storage.runtime_jobs[job_id] = nil
+    storage.runtime_results[job_id] = {
         expires = game.tick + result_lifetime_ticks,
         value = result or {completed = true}
     }
-end
-
-local function validate_action_name(action_name)
-    if type(action_name) ~= "string" or #action_name == 0 or #action_name > 128 or
-        not string.match(action_name, "^[%w_-]+$") then
-        error("Invalid FactorIA runtime action name")
-    end
-end
-
-local function install_action_source(action_name, source)
-    validate_action_name(action_name)
-    if type(source) ~= "string" or #source == 0 or #source > 256 * 1024 then
-        error("Invalid FactorIA runtime action source")
-    end
-
-    local chunk, load_error = load(source, "@factoria/" .. action_name, "t", _ENV)
-    if not chunk then
-        error(load_error)
-    end
-
-    local ok, action = pcall(chunk)
-    if not ok then
-        error(action)
-    end
-    if type(action) ~= "table" or type(action.start) ~= "function" or type(action.tick) ~= "function" then
-        error("A FactorIA runtime action must return start and tick functions")
-    end
-
-    runtime_actions[action_name] = action
-    return {installed = true, name = action_name, version = runtime_version}
 end
 
 script.on_init(ensure_storage)
@@ -355,8 +431,9 @@ script.on_event(defines.events.on_script_path_request_finished, function(event)
 end)
 
 script.on_event(defines.events.on_tick, function()
-    for job_id, job in pairs(runtime_jobs) do
-        local ok, done, result = pcall(job.action.tick, job.state)
+    ensure_storage()
+    for job_id, job in pairs(storage.runtime_jobs) do
+        local ok, done, result = pcall(player_control.tick, job.state)
         if not ok then
             stop_job_control(job)
             finish_job(job_id, {failed = true, error = tostring(done)})
@@ -365,15 +442,28 @@ script.on_event(defines.events.on_tick, function()
         end
     end
 
-    for job_id, result in pairs(runtime_results) do
+    for job_id, result in pairs(storage.runtime_results) do
         if result.expires <= game.tick then
-            runtime_results[job_id] = nil
+            storage.runtime_results[job_id] = nil
         end
     end
 end)
 
-remote.add_interface(interface_name, {
+local bridge_interface = {
     agent_status = agent_status,
+
+    peek_agent_task = function()
+        ensure_storage()
+        return agent_task_snapshot(storage.agent_task)
+    end,
+
+    claim_agent_task = claim_agent_task,
+
+    finish_agent_task = finish_agent_task,
+
+    print_model_decision = print_model_decision,
+
+    agent_task_return_target = agent_task_return_target,
 
     spawn_agent_character = function()
         local existed = stored_agent_character() ~= nil
@@ -411,9 +501,60 @@ remote.add_interface(interface_name, {
     runtime_info = function(action_name)
         return {
             version = runtime_version,
-            action_installed = action_name ~= nil and runtime_actions[action_name] ~= nil,
+            action_installed = action_name == "player_control",
+            storage_backed_jobs = true,
             research_trigger_actions = true
         }
+    end,
+
+    execute_tool = function(use_dedicated_character, tool_name, arguments)
+        local character = control_character(use_dedicated_character == true)
+        if tool_name == "get_construction_requests" then
+            return construction.get_requests(character, arguments or {})
+        elseif tool_name == "get_game_state" then
+            return gameplay.get_game_state(character, arguments or {}, use_dedicated_character == true)
+        elseif tool_name == "get_inventory" then
+            return gameplay.get_inventory(character)
+        elseif tool_name == "get_craftable_recipes" then
+            return gameplay.get_craftable_recipes(character, arguments or {})
+        elseif tool_name == "get_research_status" then
+            return gameplay.get_research_status(
+                character,
+                arguments or {},
+                use_dedicated_character == true)
+        elseif tool_name == "nearby_entity_prototypes" then
+            return inspection.nearby_prototypes(character, arguments or {})
+        elseif tool_name == "get_nearby_entities" then
+            return inspection.get_nearby_entities(character, arguments or {})
+        elseif tool_name == "find_connection_placement" then
+            return placement.find_connection(character, arguments or {})
+        elseif tool_name == "start_research" then
+            return gameplay.start_research(
+                character,
+                arguments or {},
+                use_dedicated_character == true)
+        elseif tool_name == "find_resource_patches" then
+            return gameplay.find_resource_patches(character, arguments or {})
+        elseif tool_name == "find_water" then
+            return gameplay.find_water(character, arguments or {})
+        elseif tool_name == "take_screenshot" then
+            return gameplay.take_screenshot(character, arguments or {})
+        elseif tool_name == "stop_walking" then
+            return gameplay.stop_walking(character)
+        elseif tool_name == "place_entity" then
+            return gameplay.place_entity(character, arguments or {}, use_dedicated_character == true)
+        elseif tool_name == "set_assembler_recipe" then
+            return gameplay.set_assembler_recipe(character, arguments or {})
+        elseif tool_name == "insert_item_into_entity" then
+            return gameplay.insert_item(character, arguments or {})
+        elseif tool_name == "take_item_from_entity" then
+            return gameplay.take_item(character, arguments or {})
+        elseif tool_name == "machine_output" then
+            return gameplay.machine_output(character, arguments or {})
+        elseif tool_name == "transfer_inventory_to_container" then
+            return gameplay.transfer_to_container(character, arguments or {})
+        end
+        error("Unknown FactorIA bridge tool: " .. tostring(tool_name))
     end,
 
     record_research_trigger_action = function(
@@ -451,73 +592,37 @@ remote.add_interface(interface_name, {
         }
     end,
 
-    install_action = function(action_name, source)
-        return install_action_source(action_name, source)
-    end,
-
-    begin_action_upload = function(action_name)
-        validate_action_name(action_name)
-        runtime_uploads[action_name] = {parts = {}, size = 0}
-        return true
-    end,
-
-    append_action_upload = function(action_name, source_part)
-        local upload = runtime_uploads[action_name]
-        if not upload then
-            error("FactorIA runtime action upload was not started")
-        end
-        if type(source_part) ~= "string" or #source_part == 0 or #source_part > 8 * 1024 then
-            error("Invalid FactorIA runtime action upload part")
-        end
-        if upload.size + #source_part > 256 * 1024 then
-            runtime_uploads[action_name] = nil
-            error("FactorIA runtime action upload is too large")
-        end
-
-        upload.parts[#upload.parts + 1] = source_part
-        upload.size = upload.size + #source_part
-        return {received = upload.size}
-    end,
-
-    finish_action_upload = function(action_name)
-        local upload = runtime_uploads[action_name]
-        if not upload then
-            error("FactorIA runtime action upload was not started")
-        end
-        runtime_uploads[action_name] = nil
-        return install_action_source(action_name, table.concat(upload.parts))
-    end,
-
     start_action = function(action_name, arguments)
-        local action = runtime_actions[action_name]
-        if not action then
-            error("FactorIA runtime action is not installed: " .. tostring(action_name))
+        ensure_storage()
+        if action_name ~= "player_control" then
+            error("Unknown FactorIA runtime action: " .. tostring(action_name))
         end
 
-        local ok, state, immediate_result = pcall(action.start, arguments or {})
+        local ok, state, immediate_result = pcall(player_control.start, arguments or {})
         if not ok then
             error(state)
         end
 
-        local job_id = next_job_id
-        next_job_id = next_job_id + 1
+        local job_id = storage.next_runtime_job_id
+        storage.next_runtime_job_id = job_id + 1
         if state == nil then
             return {active = false, job_id = job_id, result = immediate_result or {completed = true}}
         end
 
-        runtime_jobs[job_id] = {action_name = action_name, action = action, state = state}
+        storage.runtime_jobs[job_id] = {action_name = action_name, state = state}
         return {active = true, job_id = job_id}
     end,
 
     poll_action = function(job_id)
-        local job = runtime_jobs[job_id]
+        ensure_storage()
+        local job = storage.runtime_jobs[job_id]
         if job then
             local status = {active = true, job_id = job_id}
-            if job.action.status then
-                local ok, action_status = pcall(job.action.status, job.state)
+            if player_control.status then
+                local ok, action_status = pcall(player_control.status, job.state)
                 if not ok then
                     stop_job_control(job)
-                    runtime_jobs[job_id] = nil
+                    storage.runtime_jobs[job_id] = nil
                     return {active = false, job_id = job_id, result = {failed = true, error = tostring(action_status)}}
                 end
                 if type(action_status) == "table" then
@@ -529,24 +634,25 @@ remote.add_interface(interface_name, {
             return status
         end
 
-        local completed = runtime_results[job_id]
+        local completed = storage.runtime_results[job_id]
         if completed then
-            runtime_results[job_id] = nil
+            storage.runtime_results[job_id] = nil
             return {active = false, job_id = job_id, result = completed.value}
         end
         return {active = false, job_id = job_id, missing = true}
     end,
 
     stop_action = function(job_id)
-        local job = runtime_jobs[job_id]
+        ensure_storage()
+        local job = storage.runtime_jobs[job_id]
         if not job then
-            runtime_results[job_id] = nil
+            storage.runtime_results[job_id] = nil
             return {active = false, job_id = job_id, missing = true}
         end
 
         local result = {stopped = true}
-        if job.action.stop then
-            local ok, stop_result = pcall(job.action.stop, job.state)
+        if player_control.stop then
+            local ok, stop_result = pcall(player_control.stop, job.state)
             if not ok then
                 result = {stopped = true, failed = true, error = tostring(stop_result)}
             elseif type(stop_result) == "table" then
@@ -554,40 +660,122 @@ remote.add_interface(interface_name, {
                 result.stopped = true
             end
         end
-        runtime_jobs[job_id] = nil
-        runtime_results[job_id] = nil
+        storage.runtime_jobs[job_id] = nil
+        storage.runtime_results[job_id] = nil
         return {active = false, job_id = job_id, result = result}
-    end,
+    end
+}
 
-    request_path = function(use_dedicated_character, target_x, target_y, radius)
-        ensure_storage()
-        local character = control_character(use_dedicated_character == true)
-        return character.surface.request_path {
-            bounding_box = character.prototype.collision_box,
-            collision_mask = character.prototype.collision_mask,
-            start = character.position,
-            goal = {x = target_x, y = target_y},
-            force = character.force,
-            radius = radius,
-            pathfind_flags = {
-                allow_destroy_friendly_entities = false,
-                allow_paths_through_own_entities = false,
-                cache = false
-            },
-            can_open_gates = true,
-            entity_to_ignore = character
+remote.add_interface(interface_name, bridge_interface)
+
+local function required_command_argument(arguments, name, expected_type)
+    local value = arguments[name]
+    if type(value) ~= expected_type then
+        error("FactorIA bridge command argument '" .. name .. "' must be a " .. expected_type)
+    end
+    return value
+end
+
+local bridge_command_handlers = {
+    status = function()
+        return {
+            tick = game.tick,
+            command_protocol_version = command_protocol_version,
+            runtime_version = runtime_version
         }
     end,
 
-    take_path_result = function(path_id)
-        ensure_storage()
-        local result = storage.path_results[path_id]
-        if result then
-            storage.path_results[path_id] = nil
-        end
-        return result
+    peek_agent_task = function()
+        return {task = bridge_interface.peek_agent_task()}
+    end,
+
+    claim_agent_task = function(arguments)
+        return bridge_interface.claim_agent_task(
+            required_command_argument(arguments, "task_id", "number"))
+    end,
+
+    finish_agent_task = function(arguments)
+        return bridge_interface.finish_agent_task(
+            required_command_argument(arguments, "task_id", "number"),
+            required_command_argument(arguments, "succeeded", "boolean"),
+            required_command_argument(arguments, "message", "string"))
+    end,
+
+    print_model_decision = function(arguments)
+        return bridge_interface.print_model_decision(
+            required_command_argument(arguments, "decision", "string"))
+    end,
+
+    execute_tool = function(arguments)
+        return bridge_interface.execute_tool(
+            required_command_argument(arguments, "use_dedicated_character", "boolean"),
+            required_command_argument(arguments, "tool", "string"),
+            required_command_argument(arguments, "arguments", "table"))
+    end,
+
+    runtime_info = function(arguments)
+        return bridge_interface.runtime_info(
+            required_command_argument(arguments, "action", "string"))
+    end,
+
+    start_action = function(arguments)
+        return bridge_interface.start_action(
+            required_command_argument(arguments, "action", "string"),
+            required_command_argument(arguments, "arguments", "table"))
+    end,
+
+    poll_action = function(arguments)
+        return bridge_interface.poll_action(
+            required_command_argument(arguments, "job_id", "number"))
+    end,
+
+    stop_action = function(arguments)
+        return bridge_interface.stop_action(
+            required_command_argument(arguments, "job_id", "number"))
     end
-})
+}
+
+local function dispatch_bridge_command(parameter)
+    if type(parameter) ~= "string" or parameter == "" then
+        error("FactorIA bridge command requires a JSON request")
+    end
+
+    local request = helpers.json_to_table(parameter)
+    if type(request) ~= "table" or request.protocol_version ~= command_protocol_version then
+        error("Unsupported FactorIA bridge command protocol")
+    end
+    local operation = required_command_argument(request, "operation", "string")
+    local arguments = required_command_argument(request, "arguments", "table")
+    local handler = bridge_command_handlers[operation]
+    if not handler then
+        error("Unknown FactorIA bridge command operation: " .. operation)
+    end
+    return handler(arguments)
+end
+
+commands.add_command(
+    "factoria-bridge",
+    "Internal JSON command transport for the FactorIA desktop application.",
+    function(command)
+        if command.player_index then
+            local player = game.get_player(command.player_index)
+            if player then
+                player.print(
+                    "[FactorIA] This internal command is only available over RCON.",
+                    {color = {r = 1, g = 0.5, b = 0.3}})
+            end
+            return
+        end
+
+        local ok, result = pcall(dispatch_bridge_command, command.parameter)
+        local response = {ok = ok, protocol_version = command_protocol_version}
+        if ok then
+            response.result = result
+        else
+            response.error = tostring(result)
+        end
+        rcon.print(helpers.table_to_json(response))
+    end)
 
 local function command_player(command)
     if not command.player_index then
@@ -617,6 +805,62 @@ local function require_command_admin(command)
     return false
 end
 
+local agent_task_actions = {
+    ["build-ghosts"] = "build entity ghosts",
+    ["remove-markers"] = "remove deconstruction-marked entities"
+}
+
+local function queue_agent_task(command, kind)
+    local player = command_player(command)
+    local character = stored_agent_character()
+    ensure_storage()
+    if not player then
+        command_print(
+            command,
+            "[FactorIA] '" .. kind .. "' must be run by an in-game player.",
+            {r = 1, g = 0.5, b = 0.3})
+        return
+    elseif not character then
+        command_print(
+            command,
+            "[FactorIA] Agent is not spawned. Run /factoria-agent spawn first.",
+            {r = 1, g = 0.5, b = 0.3})
+        return
+    elseif storage.agent_task then
+        command_print(
+            command,
+            string.format(
+                "[FactorIA] Task #%d is already %s (%s).",
+                storage.agent_task.id,
+                storage.agent_task.status,
+                storage.agent_task.kind),
+            {r = 1, g = 0.75, b = 0.3})
+        return
+    end
+
+    local task_id = storage.next_agent_task_id
+    storage.next_agent_task_id = task_id + 1
+    storage.agent_task = {
+        id = task_id,
+        kind = kind,
+        status = "queued",
+        issuer_player_index = player.index,
+        issuer_name = player.name,
+        issuer_position = {x = player.position.x, y = player.position.y},
+        issuer_surface = player.surface.name,
+        search_radius = agent_task_search_radius,
+        issued_tick = game.tick
+    }
+    command_print(
+        command,
+        string.format(
+            "[FactorIA] Queued task #%d: %s within %d tiles, then return to you.",
+            task_id,
+            agent_task_actions[kind],
+            agent_task_search_radius),
+        {r = 0.3, g = 1, b = 0.5})
+end
+
 local function position_beside(surface, target)
     local offsets = {
         {x = 1.5, y = 0}, {x = -1.5, y = 0}, {x = 0, y = 1.5}, {x = 0, y = -1.5},
@@ -642,13 +886,13 @@ end
 local function print_command_help(command)
     command_print(
         command,
-        "[FactorIA] /factoria-agent status|spawn|come|goto|remove",
+        "[FactorIA] /factoria-agent status|spawn|build-ghosts|remove-markers|come|goto|remove",
         {r = 0.4, g = 0.85, b = 1})
 end
 
 commands.add_command(
     "factoria-agent",
-    "Inspect or manage the dedicated FactorIA character: /factoria-agent status|spawn|come|goto|remove",
+    "Inspect, task, or manage the dedicated FactorIA character: /factoria-agent status|spawn|build-ghosts|remove-markers|come|goto|remove",
     function(command)
         local operation = (command.parameter or ""):lower():match("^%s*(%S+)")
         if not operation or operation == "help" then
@@ -658,10 +902,15 @@ commands.add_command(
 
         if operation == "status" then
             local status = agent_status()
+            local task_suffix = status.task and string.format(
+                "; task #%d %s (%s)", status.task.id, status.task.status, status.task.kind) or ""
             if not status.spawned then
                 command_print(
                     command,
-                    string.format("[FactorIA] Agent not spawned; %d active runtime job(s).", #status.active_jobs),
+                    string.format(
+                        "[FactorIA] Agent not spawned; %d active runtime job(s)%s.",
+                        #status.active_jobs,
+                        task_suffix),
                     {r = 1, g = 0.75, b = 0.3})
                 return
             end
@@ -669,12 +918,12 @@ commands.add_command(
             command_print(
                 command,
                 string.format(
-                    "[FactorIA] Agent #%s at (%.1f, %.1f) on %s; %d active runtime job(s).",
+                    "[FactorIA] Agent #%s at (%.1f, %.1f) on %s; %d active runtime job(s)",
                     tostring(character.unit_number),
                     character.position.x,
                     character.position.y,
                     character.surface,
-                    #status.active_jobs),
+                    #status.active_jobs) .. task_suffix .. ".",
                 {r = 0.4, g = 0.85, b = 1})
             return
         end
@@ -695,6 +944,8 @@ commands.add_command(
                     character.position.y,
                     character.surface.name),
                 {r = 0.3, g = 1, b = 0.5})
+        elseif operation == "build-ghosts" or operation == "remove-markers" then
+            queue_agent_task(command, operation)
         elseif operation == "remove" then
             local result = remove_agent_character()
             command_print(
