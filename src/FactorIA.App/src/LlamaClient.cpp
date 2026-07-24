@@ -19,7 +19,6 @@ namespace
 using json = nlohmann::json;
 
 constexpr int MaximumCompletionAttempts = 5;
-constexpr auto ModelResponseTimeout = std::chrono::seconds(60);
 
 template <typename Request>
 httplib::Result SendTrackedRequest(const LlamaClient::RequestHandler& handler, Request&& request)
@@ -34,13 +33,13 @@ httplib::Result SendTrackedRequest(const LlamaClient::RequestHandler& handler, R
     return response;
 }
 
-httplib::Client CreateCompletionConnection(const std::string& origin)
+httplib::Client CreateCompletionConnection(const std::string& origin, std::chrono::seconds responseTimeout)
 {
     httplib::Client client(origin);
     client.set_connection_timeout(std::chrono::seconds(10));
-    client.set_read_timeout(ModelResponseTimeout);
+    client.set_read_timeout(responseTimeout);
     client.set_write_timeout(std::chrono::seconds(30));
-    client.set_max_timeout(ModelResponseTimeout);
+    client.set_max_timeout(responseTimeout);
     return client;
 }
 
@@ -55,6 +54,146 @@ std::string Lowercase(std::string text)
         return static_cast<char>(std::tolower(character));
     });
     return text;
+}
+
+bool ContainsCaseInsensitive(std::string_view text, std::string_view value)
+{
+    return std::search(text.begin(), text.end(), value.begin(), value.end(), [](char left, char right) {
+        return std::tolower(static_cast<unsigned char>(left)) ==
+            std::tolower(static_cast<unsigned char>(right));
+    }) != text.end();
+}
+
+bool IsReasoningKey(std::string_view key)
+{
+    const auto normalized = Lowercase(std::string(key));
+    return normalized == "reasoning" || normalized == "reasoning_details" || normalized == "reasoningdetails";
+}
+
+bool IsCredentialKey(std::string_view key)
+{
+    const auto normalized = Lowercase(std::string(key));
+    return normalized == "authorization" || normalized == "proxy_authorization" ||
+        normalized == "proxy-authorization" || normalized == "api_key" || normalized == "api-key" ||
+        normalized == "apikey" || normalized == "x_api_key" || normalized == "x-api-key" ||
+        normalized == "access_token" || normalized == "refresh_token" || normalized == "bearer_token" ||
+        normalized == "id_token" || normalized == "token" || normalized == "key" || normalized == "password" ||
+        normalized == "secret" || normalized == "client_secret" || normalized == "credentials" ||
+        normalized == "credential";
+}
+
+std::string SanitizedDiagnosticString(std::string_view value)
+{
+    if (ContainsCaseInsensitive(value, "data:image/"))
+    {
+        return "<image data omitted (" + std::to_string(value.size()) + " chars)>";
+    }
+
+    constexpr std::string_view credentialMarkers[]{
+        "bearer ",
+        "authorization:",
+        "authorization=",
+        "api_key",
+        "api-key",
+        "x-api-key",
+        "access_token=",
+        "refresh_token=",
+        "bearer_token=",
+        "?key=",
+        "&key=",
+        "?token=",
+        "&token=",
+    };
+    if (std::ranges::any_of(credentialMarkers, [&value](std::string_view marker) {
+            return ContainsCaseInsensitive(value, marker);
+        }))
+    {
+        return "<redacted credential>";
+    }
+    return std::string(value);
+}
+
+json SanitizedDiagnosticPayload(const json& value)
+{
+    if (value.is_object())
+    {
+        json sanitized = json::object();
+        for (const auto& [key, nested] : value.items())
+        {
+            if (IsReasoningKey(key))
+                sanitized[key] = "<redacted reasoning>";
+            else if (IsCredentialKey(key))
+                sanitized[key] = "<redacted credential>";
+            else
+                sanitized[key] = SanitizedDiagnosticPayload(nested);
+        }
+        return sanitized;
+    }
+    if (value.is_array())
+    {
+        json sanitized = json::array();
+        for (const auto& nested : value)
+            sanitized.push_back(SanitizedDiagnosticPayload(nested));
+        return sanitized;
+    }
+    if (value.is_string())
+        return SanitizedDiagnosticString(value.get_ref<const std::string&>());
+    return value;
+}
+
+void EmitCompletionEvent(
+    const LlamaClient::CompletionObserver& observer,
+    LlamaCompletionEvent::Kind kind,
+    int attempt,
+    const json& payload)
+{
+    if (!observer)
+        return;
+
+    observer({
+        .kind = kind,
+        .attempt = attempt,
+        .payload = SanitizedDiagnosticPayload(payload),
+    });
+}
+
+json CompletionResponsePayload(const httplib::Result& response)
+{
+    json payload{{"http_status", response->status}};
+    if (response->body.empty())
+    {
+        payload["body"] = nullptr;
+        return payload;
+    }
+
+    try
+    {
+        payload["body"] = json::parse(response->body);
+    }
+    catch (const json::exception&)
+    {
+        // Raw provider bodies can contain echoed credentials, so keep only their size.
+        payload["body"] = {
+            {"format", "non-json"},
+            {"size_bytes", response->body.size()},
+        };
+    }
+    return payload;
+}
+
+json CompletionFailurePayload(
+    std::string_view reason,
+    const httplib::Result& response,
+    bool timedOut = false)
+{
+    json payload{{"reason", reason}};
+    if (response)
+        payload["http_status"] = response->status;
+    else
+        payload["transport_error"] = httplib::to_string(response.error());
+    if (timedOut)
+        payload["timed_out"] = true;
+    return payload;
 }
 
 bool IsRetryableProviderError(const json& body)
@@ -437,10 +576,22 @@ LlamaModelCapabilities LlamaClient::Capabilities() const
 LlamaTurn LlamaClient::Complete(
     const json& messages,
     const json& tools,
-    const TraceHandler& trace) const
+    const TraceHandler& trace,
+    const CompletionObserver& observer,
+    LlamaCompletionOptions options) const
 {
+    if (options.responseTimeout <= std::chrono::seconds::zero())
+        throw std::invalid_argument("AI completion response timeout must be positive");
+
     if (!messages.is_array() || messages.empty())
+    {
+        EmitCompletionEvent(
+            observer,
+            LlamaCompletionEvent::Kind::Failure,
+            0,
+            {{"reason", "invalid_request"}, {"stage", "validation"}});
         throw std::runtime_error("An AI completion requires at least one message");
+    }
 
     json request{
         {"model", model_},
@@ -457,15 +608,23 @@ LlamaTurn LlamaClient::Complete(
         request["tool_choice"] = "auto";
     }
     TraceModelRequest(trace, request);
+    EmitCompletionEvent(observer, LlamaCompletionEvent::Kind::Request, 0, request);
 
     const auto action = IsOpenRouter() ? "OpenRouter completion" : "llama.cpp completion";
     // Keep one immutable request snapshot so replacing a stalled connection cannot
     // drop or advance the conversation state seen by the model.
     const auto requestBody = request.dump();
     std::optional<json> completedBody;
+    int completedAttempt = 0;
     for (int attempt = 1; attempt <= MaximumCompletionAttempts; ++attempt)
     {
-        auto client = CreateCompletionConnection(endpoint_.origin);
+        EmitCompletionEvent(
+            observer,
+            LlamaCompletionEvent::Kind::Attempt,
+            attempt,
+            {{"method", "POST"}, {"path", ChatPath()}});
+
+        auto client = CreateCompletionConnection(endpoint_.origin, options.responseTimeout);
         const auto requestStartedAt = std::chrono::steady_clock::now();
         const auto response = SendTrackedRequest(requestHandler_, [this, &client, &requestBody] {
             return IsOpenRouter()
@@ -473,14 +632,18 @@ LlamaTurn LlamaClient::Complete(
                 : client.Post(ChatPath(), requestBody, "application/json");
         });
         const auto responseWait = std::chrono::steady_clock::now() - requestStartedAt;
-        const auto responseTimedOut = !response && responseWait >= ModelResponseTimeout;
+        const auto responseTimedOut = !response && responseWait >= options.responseTimeout;
+        if (response)
+            EmitCompletionEvent(observer, LlamaCompletionEvent::Kind::Response, attempt, CompletionResponsePayload(response));
 
         std::string failure;
+        std::string failureReason;
         bool retryable = false;
         if (!response || response->status < 200 || response->status >= 300)
         {
             failure = HttpFailure(action, response);
             retryable = !response || IsRetryableHttpStatus(response->status);
+            failureReason = response ? "http_error" : "transport_error";
         }
         else
         {
@@ -492,10 +655,12 @@ LlamaTurn LlamaClient::Complete(
                 {
                     failure = ProviderError(body);
                     retryable = IsRetryableProviderError(body);
+                    failureReason = "provider_error";
                 }
                 else
                 {
                     completedBody = std::move(body);
+                    completedAttempt = attempt;
                     break;
                 }
             }
@@ -503,18 +668,30 @@ LlamaTurn LlamaClient::Complete(
             {
                 failure = error.what();
                 retryable = true;
+                failureReason = "invalid_response";
             }
         }
 
         if (!retryable || attempt == MaximumCompletionAttempts)
+        {
+            EmitCompletionEvent(
+                observer,
+                LlamaCompletionEvent::Kind::Failure,
+                attempt,
+                CompletionFailurePayload(failureReason, response, responseTimedOut));
             throw std::runtime_error(failure);
+        }
 
         if (responseTimedOut)
         {
+            auto retryPayload = CompletionFailurePayload(failureReason, response, true);
+            retryPayload["next_attempt"] = attempt + 1;
+            retryPayload["delay_seconds"] = 0;
+            EmitCompletionEvent(observer, LlamaCompletionEvent::Kind::Retry, attempt, retryPayload);
             if (trace)
             {
                 trace("[MODEL TIMEOUT] No response after " +
-                    std::to_string(ModelResponseTimeout.count()) +
+                    std::to_string(options.responseTimeout.count()) +
                     " seconds; reconnecting with the same conversation state (retry " +
                     std::to_string(attempt) + " of " +
                     std::to_string(MaximumCompletionAttempts - 1) + ")");
@@ -523,6 +700,10 @@ LlamaTurn LlamaClient::Complete(
         }
 
         const auto delay = std::chrono::seconds(1 << attempt);
+        auto retryPayload = CompletionFailurePayload(failureReason, response);
+        retryPayload["next_attempt"] = attempt + 1;
+        retryPayload["delay_seconds"] = delay.count();
+        EmitCompletionEvent(observer, LlamaCompletionEvent::Kind::Retry, attempt, retryPayload);
         if (trace)
         {
             trace("[PROVIDER RETRY] " + failure + "\nRetry " + std::to_string(attempt) + " of " +
@@ -532,50 +713,68 @@ LlamaTurn LlamaClient::Complete(
         std::this_thread::sleep_for(delay);
     }
     if (!completedBody)
-        throw std::runtime_error("AI completion failed without a provider response");
-    const auto& body = *completedBody;
-
-    const auto choices = body.find("choices");
-    if (choices == body.end() || !choices->is_array() || choices->empty())
-        throw std::runtime_error("AI completion did not contain a choice");
-    const auto messageIt = choices->front().find("message");
-    if (messageIt == choices->front().end() || !messageIt->is_object())
-        throw std::runtime_error("AI completion did not contain an assistant message");
-
-    LlamaTurn turn;
-    turn.finishReason = choices->front().value("finish_reason", std::string{});
-    if (const auto usage = body.find("usage"); usage != body.end() && usage->is_object())
-        turn.promptTokens = usage->value("prompt_tokens", std::size_t{});
-    turn.assistantMessage = *messageIt;
-    turn.assistantMessage["role"] = "assistant";
-    if (const auto content = messageIt->find("content"); content != messageIt->end() && content->is_string())
-        turn.content = content->get<std::string>();
-
-    const auto calls = messageIt->find("tool_calls");
-    if (calls == messageIt->end() || calls->is_null())
-        return turn;
-    if (!calls->is_array())
-        throw std::runtime_error("AI tool_calls value is not an array");
-
-    for (std::size_t index = 0; index < calls->size(); ++index)
     {
-        const auto& call = (*calls)[index];
-        if (!call.is_object())
-            throw std::runtime_error("AI provider returned a malformed tool call");
-        const auto function = call.find("function");
-        if (function == call.end() || !function->is_object())
-            throw std::runtime_error("AI tool call has no function object");
-
-        LlamaToolCall parsed;
-        parsed.id = call.value("id", std::string{});
-        parsed.name = function->value("name", std::string{});
-        if (parsed.id.empty() || parsed.name.empty())
-            throw std::runtime_error("AI tool call has no id or function name");
-        parsed.arguments = ParseToolArguments(function->value("arguments", json::object()));
-        turn.assistantMessage["tool_calls"][index]["function"]["arguments"] = parsed.arguments.dump();
-        turn.toolCalls.push_back(std::move(parsed));
+        EmitCompletionEvent(
+            observer,
+            LlamaCompletionEvent::Kind::Failure,
+            MaximumCompletionAttempts,
+            {{"reason", "missing_provider_response"}});
+        throw std::runtime_error("AI completion failed without a provider response");
     }
-    return turn;
+    const auto& body = *completedBody;
+    try
+    {
+        const auto choices = body.find("choices");
+        if (choices == body.end() || !choices->is_array() || choices->empty())
+            throw std::runtime_error("AI completion did not contain a choice");
+        const auto messageIt = choices->front().find("message");
+        if (messageIt == choices->front().end() || !messageIt->is_object())
+            throw std::runtime_error("AI completion did not contain an assistant message");
+
+        LlamaTurn turn;
+        turn.finishReason = choices->front().value("finish_reason", std::string{});
+        if (const auto usage = body.find("usage"); usage != body.end() && usage->is_object())
+            turn.promptTokens = usage->value("prompt_tokens", std::size_t{});
+        turn.assistantMessage = *messageIt;
+        turn.assistantMessage["role"] = "assistant";
+        if (const auto content = messageIt->find("content"); content != messageIt->end() && content->is_string())
+            turn.content = content->get<std::string>();
+
+        const auto calls = messageIt->find("tool_calls");
+        if (calls == messageIt->end() || calls->is_null())
+            return turn;
+        if (!calls->is_array())
+            throw std::runtime_error("AI tool_calls value is not an array");
+
+        for (std::size_t index = 0; index < calls->size(); ++index)
+        {
+            const auto& call = (*calls)[index];
+            if (!call.is_object())
+                throw std::runtime_error("AI provider returned a malformed tool call");
+            const auto function = call.find("function");
+            if (function == call.end() || !function->is_object())
+                throw std::runtime_error("AI tool call has no function object");
+
+            LlamaToolCall parsed;
+            parsed.id = call.value("id", std::string{});
+            parsed.name = function->value("name", std::string{});
+            if (parsed.id.empty() || parsed.name.empty())
+                throw std::runtime_error("AI tool call has no id or function name");
+            parsed.arguments = ParseToolArguments(function->value("arguments", json::object()));
+            turn.assistantMessage["tool_calls"][index]["function"]["arguments"] = parsed.arguments.dump();
+            turn.toolCalls.push_back(std::move(parsed));
+        }
+        return turn;
+    }
+    catch (const std::exception& error)
+    {
+        EmitCompletionEvent(
+            observer,
+            LlamaCompletionEvent::Kind::Failure,
+            completedAttempt,
+            {{"reason", "invalid_completion"}, {"stage", "response_validation"}, {"message", error.what()}});
+        throw;
+    }
 }
 
 LlamaClient::Endpoint LlamaClient::ParseEndpoint(const std::string& baseUrl)

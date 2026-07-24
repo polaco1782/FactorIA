@@ -24,6 +24,8 @@ The initial application shell provides:
 - collision-aware `walk_to` routing and tick-synchronized walking and mining through the bundled FactorIA Bridge mod;
 - optional persistent AI-owned character control, keeping the human player's character and inventory separate;
 - an Agent tab for objectives, execution limits up to 999 rounds, optional non-stop execution, final output, and full tool tracing;
+- SQLite-backed agent sessions that persist safe conversation checkpoints, model turns, tool calls/results, and bridge traffic across application restarts;
+- a desktop Database tab for inspecting recorded sessions and resuming a saved general-agent context;
 - a mobile-friendly local web panel with real-time WebSocket status and model decisions plus run, stop, connect, and disconnect controls;
 - a structured, timestamped application log containing redacted model requests, provider responses, decision summaries, tool calls, and tool results.
 
@@ -61,6 +63,8 @@ for its password without echoing it. Set `FACTORIO_RCON_PASSWORD` when starting
 the server non-interactively through a service manager.
 
 Settings are stored in the platform-specific user configuration directory under `FactorIA/settings.json`.
+The same directory contains `FactorIA/history.sqlite3`, which retains agent checkpoints and a redacted debugging history. Provider keys, RCON passwords, image payloads in the history viewer, and provider reasoning are not exposed there.
+Use **Save checkpoint** and **Resume saved context** in the Agent tab to continue a general-agent run after restarting. The Database tab lists sessions, structured model/bridge events, and older event pages for debugging.
 
 ### Mobile web control
 

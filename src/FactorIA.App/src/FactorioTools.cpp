@@ -330,11 +330,13 @@ FactorioTools::FactorioTools(
     CommandExecutor executeCommand,
     std::filesystem::path factorioUserDataPath,
     bool useDedicatedCharacter,
-    std::optional<FactorioAgentTask> agentTask)
+    std::optional<FactorioAgentTask> agentTask,
+    BridgeEventHandler bridgeEvent)
     : executeCommand_(std::move(executeCommand)),
       factorioUserDataPath_(std::move(factorioUserDataPath)),
       useDedicatedCharacter_(useDedicatedCharacter),
-      agentTask_(std::move(agentTask))
+      agentTask_(std::move(agentTask)),
+      bridgeEvent_(std::move(bridgeEvent))
 {
     if (!executeCommand_)
         throw std::runtime_error("FactorioTools requires an RCON command executor");
@@ -361,7 +363,7 @@ FactorioTools::FactorioTools(
             }),
         FunctionTool(
             "get_research_status",
-            "Get a snapshot of current and queued lab research, startable technologies, and trigger-based milestones such as crafting an item or building an entity. Call with {} to list every currently relevant technology. Set technology only to an exact technology name returned by this tool; item and recipe names are not technology names. Omit the optional field when listing rather than sending an empty string or null. When this reports active lab research, call wait_for_research once instead of polling this tool.",
+            "Get current and queued research, startable technologies, trigger milestones, and the current force's lab power/status summary. Call with {} to list every relevant technology. Set technology only to an exact name returned by this tool; item and recipe names are not technology names. Omit the optional field when listing. For current lab research, wait_for_research is allowed only when research_wait_ready=true. If false, repair the exact lab_status blocker first: unpowered_labs require power generation and an electric-pole connection; no working labs may also need the required science packs. Recheck this tool after repair.",
             {
                 {"type", "object"},
                 {"properties", {
@@ -371,7 +373,7 @@ FactorioTools::FactorioTools(
             }),
         FunctionTool(
             "start_research",
-            "Start an available lab technology when research is idle, or append it to the force research queue. Trigger-based milestones cannot be queued; perform the reported trigger action instead. Use get_research_status first, then place a lab and insert the required science packs into its input inventory. When the technology becomes current, call wait_for_research once instead of polling its status.",
+            "Start an available lab technology when research is idle, or append it to the force research queue. Trigger milestones cannot be queued; perform the reported trigger action instead. Use get_research_status first. When this result makes the technology current, it includes lab_status and research_wait_ready: repair its reported power/science blockers and recheck status unless research_wait_ready=true. Only then call wait_for_research.",
             {
                 {"type", "object"},
                 {"properties", {
@@ -382,7 +384,7 @@ FactorioTools::FactorioTools(
             }),
         FunctionTool(
             "wait_for_research",
-            "Wait inside one tool call for the specified current lab technology to finish. Use the exact current technology name reported by get_research_status or start_research. Returns early if research completes, stops making progress, is cancelled, or the timeout expires. Do not repeatedly poll get_research_status while lab research is active.",
+            "Wait inside one tool call for the specified current lab technology to finish. Call only after get_research_status or start_research reports research_wait_ready=true. This tool is not a way to repair labs: it returns immediately when no lab is working, including when labs lack power. Use the exact current technology name. Returns early if research completes, stops making progress, is cancelled, or the timeout expires.",
             {
                 {"type", "object"},
                 {"properties", {
@@ -394,7 +396,7 @@ FactorioTools::FactorioTools(
             }),
         FunctionTool(
             "get_nearby_entities",
-            "Return a page of up to 40 nearby entities with character-relative deltas and Factorio-resolved connection geometry. A minimal unfiltered call contains only radius. Omit name, type, and regex when they are unknown; never fill optional filters with empty strings or null. type must be a real Factorio entity type such as furnace, resource, or container; 'entity' is not a wildcard. regex searches both prototype names and entity types. Relevant entities report verified item, belt, fluid, electric, heat, wall, and collision geometry. Distinct prototypes precede duplicates and next_offset retrieves another page. This cannot find water tiles; use find_water. Factorio X increases east and Y increases south.",
+            "Return a page of up to 40 nearby entities with character-relative deltas and Factorio-resolved connection geometry. A minimal unfiltered call contains only radius. Omit name, type, and regex when they are unknown; never fill optional filters with empty strings or null. type must be a real Factorio entity type such as furnace, resource, or container. Generic categories such as building, structure, item, or entity are not wildcards. For storage, use the exact type container or logistic-container. regex searches both prototype names and entity types. Relevant entities report verified item, belt, fluid, electric, heat, wall, and collision geometry. Distinct prototypes precede duplicates and next_offset retrieves another page. This cannot find water tiles; use find_water. Factorio X increases east and Y increases south.",
             {
                 {"type", "object"},
                 {"properties", {
@@ -825,7 +827,47 @@ json FactorioTools::ExecuteBridgeCommand(std::string_view operation, const json&
         {"operation", std::string(operation)},
         {"arguments", arguments},
     };
-    return ParseBridgeResponse(executeCommand_(std::string(BridgeCommand) + request.dump()));
+    const auto command = std::string(BridgeCommand) + request.dump();
+    if (bridgeEvent_)
+    {
+        bridgeEvent_({
+            .kind = BridgeCommandEvent::Kind::Sent,
+            .operation = std::string(operation),
+            .command = command,
+            .response = {},
+            .error = {},
+        });
+    }
+
+    try
+    {
+        const auto response = executeCommand_(command);
+        if (bridgeEvent_)
+        {
+            bridgeEvent_({
+                .kind = BridgeCommandEvent::Kind::Received,
+                .operation = std::string(operation),
+                .command = command,
+                .response = response,
+                .error = {},
+            });
+        }
+        return ParseBridgeResponse(response);
+    }
+    catch (const std::exception& error)
+    {
+        if (bridgeEvent_)
+        {
+            bridgeEvent_({
+                .kind = BridgeCommandEvent::Kind::Failed,
+                .operation = std::string(operation),
+                .command = command,
+                .response = {},
+                .error = error.what(),
+            });
+        }
+        throw;
+    }
 }
 
 json FactorioTools::ExecuteBridgeTool(const std::string& name, const json& arguments) const
@@ -954,7 +996,8 @@ json FactorioTools::GetResearchStatus(const json& arguments) const
     const auto activeTechnology = requestedTechnology.empty()
         ? result.find("current")
         : result.find("technology");
-    if (activeTechnology != result.end() && activeTechnology->is_object() &&
+    if (result.value("research_wait_ready", false) &&
+        activeTechnology != result.end() && activeTechnology->is_object() &&
         activeTechnology->contains("progress") &&
         activeTechnology->value("research_mode", std::string{}) == "lab")
     {
@@ -968,7 +1011,8 @@ json FactorioTools::StartResearch(const json& arguments) const
     const auto technologyName = RequiredPrototypeName(arguments, "technology");
     auto result = ExecuteBridgeTool("start_research", {{"technology", technologyName}});
     const auto currentTechnology = result.value("current_research", std::string{});
-    if (result.value("accepted", false) && currentTechnology == technologyName)
+    if (result.value("accepted", false) && currentTechnology == technologyName &&
+        result.value("research_wait_ready", false))
         AttachResearchWaitHint(result, technologyName);
     return result;
 }
@@ -1019,6 +1063,18 @@ json FactorioTools::WaitForResearch(const json& arguments, std::stop_token stopT
             snapshot["target_met"] = false;
             snapshot["stalled"] = true;
             return finish("trigger_action_required");
+        }
+        if (!snapshot.value("research_wait_ready", false))
+        {
+            snapshot.erase("wait_tool");
+            snapshot.erase("wait_tool_arguments");
+            snapshot["target_met"] = false;
+            snapshot["stalled"] = true;
+            const auto labs = snapshot.find("lab_status");
+            return finish(labs != snapshot.end() && labs->is_object() &&
+                labs->value("unpowered_labs", 0) > 0
+                ? "labs_without_power"
+                : "labs_not_ready_for_research");
         }
 
         const auto level = technology->value("level", 0);
@@ -1105,9 +1161,10 @@ json FactorioTools::GetNearbyEntities(const json& arguments) const
 
         // Keep ECMAScript matching in C++, but let the bridge own the Factorio entity survey.
         const auto catalog = ExecuteBridgeTool("nearby_entity_prototypes", request);
+        const auto catalogPrototypes = catalog.value("prototypes", json::array());
 
         json matchingNames = json::array();
-        for (const auto& prototype : catalog.value("prototypes", json::array()))
+        for (const auto& prototype : catalogPrototypes)
         {
             const auto name = prototype.value("name", std::string{});
             const auto type = prototype.value("type", std::string{});
@@ -1117,6 +1174,13 @@ json FactorioTools::GetNearbyEntities(const json& arguments) const
 
         if (matchingNames.empty())
         {
+            json nearbyPrototypes = json::array();
+            for (const auto& prototype : catalogPrototypes)
+            {
+                if (nearbyPrototypes.size() == 20)
+                    break;
+                nearbyPrototypes.push_back(prototype);
+            }
             return {
                 {"radius", radius},
                 {"player_position", catalog.value("player_position", json::object())},
@@ -1127,6 +1191,15 @@ json FactorioTools::GetNearbyEntities(const json& arguments) const
                 {"distinct_prototypes", 0},
                 {"truncated", false},
                 {"entities", json::array()},
+                {"filter_matched", false},
+                {"nearby_distinct_prototypes", catalogPrototypes.size()},
+                {"diagnostic", "No nearby prototype name or entity type matched this regex. This filtered "
+                    "result does not prove that no entities are nearby."},
+                {"recovery", "Do not try another generic synonym. Use an exact name or type from "
+                    "nearby_prototypes, retry once with only radius, or move before scanning again. "
+                    "Storage entities use the exact types container and logistic-container."},
+                {"nearby_prototypes", std::move(nearbyPrototypes)},
+                {"nearby_prototypes_truncated", catalogPrototypes.size() > 20},
             };
         }
 

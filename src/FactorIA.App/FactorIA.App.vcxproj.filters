@@ -6,6 +6,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\AgentController.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\AgentHistoryDatabase.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\AppSettings.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\FactorioTools.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\LlamaClient.cpp"><Filter>Source Files</Filter></ClCompile>
@@ -16,6 +17,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\FactorIA\AgentController.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="include\FactorIA\AgentHistoryDatabase.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="include\FactorIA\AppSettings.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="include\FactorIA\FactorioTools.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="include\FactorIA\LlamaClient.h"><Filter>Header Files</Filter></ClInclude>

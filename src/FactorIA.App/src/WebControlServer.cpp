@@ -68,6 +68,11 @@ constexpr auto EmbeddedPage = R"HTML(<!doctype html>
     .feedback { min-height: 20px; margin: 10px 2px 0; color: #93c5fd; font-size: .83rem; }
     .feed-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 10px; }
     .feed-head span { color: #8fa2be; font-size: .78rem; }
+    .inventory-grid { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 1px; overflow: hidden; border: 1px solid #334155; border-radius: 10px; background: #334155; }
+    .inventory-grid > div { min-width: 0; padding: 9px 10px; background: #0c1628; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .inventory-grid .head { background: #18243a; color: #8fa2be; font-size: .7rem; font-weight: 750; letter-spacing: .07em; text-transform: uppercase; }
+    .inventory-grid .count { font-variant-numeric: tabular-nums; text-align: right; }
+    .inventory-grid .empty { grid-column: 1 / -1; }
     #decisions { display: grid; max-height: 52vh; overflow-y: auto; gap: 8px; overscroll-behavior: contain; }
     .decision { padding: 11px 12px; border-left: 3px solid #3b82f6; border-radius: 8px; background: #0c1628; line-height: 1.4; overflow-wrap: anywhere; }
     .decision time { display: block; margin-bottom: 4px; color: #7890b0; font-size: .7rem; }
@@ -119,6 +124,11 @@ constexpr auto EmbeddedPage = R"HTML(<!doctype html>
       <div class="feed-head"><h2>Model decisions</h2><span id="decision-count">0 received</span></div>
       <div id="decisions" aria-live="polite"><div class="empty">Decisions will appear here in real time.</div></div>
     </section>
+
+    <section class="card">
+      <div class="feed-head"><h2>AI player inventory</h2><span id="inventory-status">Not connected</span></div>
+      <div id="inventory" class="inventory-grid" aria-live="polite"></div>
+    </section>
   </main>
   <script>
     const byId = id => document.getElementById(id);
@@ -127,7 +137,8 @@ constexpr auto EmbeddedPage = R"HTML(<!doctype html>
       agent: byId('agent-state'), control: byId('control-state'), instruction: byId('instruction'),
       rounds: byId('rounds'), nonStop: byId('non-stop'), run: byId('run'), stop: byId('stop'),
       connect: byId('connect'), disconnect: byId('disconnect'), feedback: byId('feedback'),
-      decisions: byId('decisions'), count: byId('decision-count')
+      decisions: byId('decisions'), count: byId('decision-count'), inventory: byId('inventory'),
+      inventoryStatus: byId('inventory-status')
     };
     let state = null;
     let socket;
@@ -159,6 +170,43 @@ constexpr auto EmbeddedPage = R"HTML(<!doctype html>
       ui.stop.disabled = !next.agent_running;
       ui.connect.disabled = next.connected || next.busy;
       ui.disconnect.disabled = !next.connected || next.busy;
+      renderInventory(next.inventory || {});
+    }
+
+    function renderInventory(inventory) {
+      const items = Array.isArray(inventory.items) ? inventory.items : [];
+      ui.inventoryStatus.textContent = inventory.status || 'Unavailable';
+      ui.inventory.replaceChildren();
+      if (!inventory.available) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = inventory.status || 'Inventory unavailable';
+        ui.inventory.append(empty);
+        return;
+      }
+      for (const title of ['Item', 'Count', 'Quality']) {
+        const cell = document.createElement('div');
+        cell.className = title === 'Count' ? 'head count' : 'head';
+        cell.textContent = title;
+        ui.inventory.append(cell);
+      }
+      if (!items.length) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = 'The AI player inventory is empty.';
+        ui.inventory.append(empty);
+        return;
+      }
+      for (const item of items) {
+        const name = document.createElement('div');
+        name.textContent = item.name || 'Unknown item';
+        const count = document.createElement('div');
+        count.className = 'count';
+        count.textContent = Number.isFinite(item.count) ? item.count.toLocaleString() : '0';
+        const quality = document.createElement('div');
+        quality.textContent = item.quality || 'normal';
+        ui.inventory.append(name, count, quality);
+      }
     }
 
     function appendDecision(item) {
@@ -379,6 +427,15 @@ private:
 
     json StateJsonLocked(const char* type, bool includeDecisions) const
     {
+        json inventory = json::array();
+        for (const auto& item : state_.inventory)
+        {
+            inventory.push_back({
+                {"name", item.name},
+                {"count", item.count},
+                {"quality", item.quality},
+            });
+        }
         json result{
             {"type", type},
             {"connected", state_.connected},
@@ -388,6 +445,11 @@ private:
             {"objective", state_.objective},
             {"maximum_rounds", state_.maximumRounds},
             {"non_stop", state_.nonStop},
+            {"inventory", {
+                {"available", state_.inventoryAvailable},
+                {"status", state_.inventoryStatus},
+                {"items", std::move(inventory)},
+            }},
         };
         if (includeDecisions)
             result["decisions"] = decisions_;

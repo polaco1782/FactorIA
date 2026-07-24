@@ -92,6 +92,51 @@ local function research_queue(force)
     return queue, queued
 end
 
+local function research_lab_status(force)
+    local summary = {
+        total_labs = 0,
+        connected_labs = 0,
+        powered_labs = 0,
+        unpowered_labs = 0,
+        low_power_labs = 0,
+        working_labs = 0,
+        blocked_labs = {}
+    }
+
+    for _, surface in pairs(game.surfaces) do
+        for _, lab in ipairs(surface.find_entities_filtered {force = force, type = "lab"}) do
+            local connected = lab.is_connected_to_electric_network()
+            local status = inspection.status_name(lab) or "unknown"
+            local no_power = not connected or status == "no_power"
+            local low_power = status == "low_power"
+            summary.total_labs = summary.total_labs + 1
+            if connected then summary.connected_labs = summary.connected_labs + 1 end
+            if no_power then
+                summary.unpowered_labs = summary.unpowered_labs + 1
+            elseif low_power then
+                summary.low_power_labs = summary.low_power_labs + 1
+            else
+                summary.powered_labs = summary.powered_labs + 1
+            end
+            if status == "working" then summary.working_labs = summary.working_labs + 1 end
+
+            if status ~= "working" and #summary.blocked_labs < 6 then
+                summary.blocked_labs[#summary.blocked_labs + 1] = {
+                    name = lab.name,
+                    surface = surface.name,
+                    position = {x = lab.position.x, y = lab.position.y},
+                    status = status,
+                    connected_to_electric_network = connected
+                }
+            end
+        end
+    end
+
+    -- A powered lab alone is not enough: Factorio must report a lab as working before waiting can advance research.
+    summary.ready_for_research_wait = summary.working_labs > 0
+    return summary
+end
+
 local function technology_info(technology, use_dedicated_character)
     local prerequisites = {}
     local missing = {}
@@ -306,8 +351,18 @@ function gameplay.get_research_status(player, arguments, use_dedicated_character
         if not technology then error("Unknown technology: " .. tostring(arguments.technology)) end
         local info = technology_info(technology, use_dedicated_character)
         info.queued = queued[technology.name] or false
-        if force.current_research == technology then info.progress = force.research_progress end
-        return {research_enabled = force.research_enabled, technology = info, queue = queue}
+        local labs = nil
+        if force.current_research == technology then
+            info.progress = force.research_progress
+            labs = research_lab_status(force)
+        end
+        return {
+            research_enabled = force.research_enabled,
+            technology = info,
+            queue = queue,
+            lab_status = labs,
+            research_wait_ready = labs and labs.ready_for_research_wait or false
+        }
     end
 
     local available = {}
@@ -329,10 +384,13 @@ function gameplay.get_research_status(player, arguments, use_dedicated_character
     local current = force.current_research and
         technology_info(force.current_research, use_dedicated_character) or nil
     if current then current.progress = force.research_progress end
+    local labs = current and research_lab_status(force) or nil
     return {
         research_enabled = force.research_enabled,
         current = current,
         queue = queue,
+        lab_status = labs,
+        research_wait_ready = labs and labs.ready_for_research_wait or false,
         available = available,
         total_available = total,
         truncated = total > #available,
@@ -374,6 +432,7 @@ function gameplay.start_research(player, arguments, use_dedicated_character)
     end
     queue, queued = research_queue(force)
     local accepted = queued[technology.name] == true
+    local labs = force.current_research == technology and research_lab_status(force) or nil
     return {
         accepted = accepted,
         already_queued = already_queued,
@@ -382,7 +441,9 @@ function gameplay.start_research(player, arguments, use_dedicated_character)
         technology = info,
         queue = queue,
         current_research = force.current_research and force.current_research.name or nil,
-        research_progress = force.research_progress
+        research_progress = force.research_progress,
+        lab_status = labs,
+        research_wait_ready = labs and labs.ready_for_research_wait or false
     }
 end
 

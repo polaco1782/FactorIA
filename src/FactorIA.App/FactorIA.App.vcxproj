@@ -48,11 +48,12 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>ws2_32.lib;comctl32.lib;rpcrt4.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>sqlite3.lib;ws2_32.lib;comctl32.lib;rpcrt4.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\AgentController.cpp" />
+    <ClCompile Include="src\AgentHistoryDatabase.cpp" />
     <ClCompile Include="src\AppSettings.cpp" />
     <ClCompile Include="src\FactorioTools.cpp" />
     <ClCompile Include="src\LlamaClient.cpp" />
@@ -63,6 +64,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\FactorIA\AgentController.h" />
+    <ClInclude Include="include\FactorIA\AgentHistoryDatabase.h" />
     <ClInclude Include="include\FactorIA\AppSettings.h" />
     <ClInclude Include="include\FactorIA\FactorioTools.h" />
     <ClInclude Include="include\FactorIA\LlamaClient.h" />

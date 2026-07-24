@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstddef>
 #include <stdexcept>
 #include <string_view>
@@ -17,9 +18,13 @@ using json = nlohmann::json;
 
 constexpr int MaximumConsecutiveInvalidTerminalTurns = 3;
 constexpr int MaximumConsecutiveIdenticalFailedToolCalls = 3;
+constexpr int UnproductiveObservationCorrectionThreshold = 3;
+constexpr int MaximumConsecutiveUnproductiveObservationCalls = 6;
 constexpr int MaximumCompactionAttempts = 3;
-constexpr std::size_t LocalPromptTokenCompactionThreshold = 12000;
+constexpr std::size_t LocalPromptTokenCompactionThreshold = 32768;
 constexpr std::size_t MinimumReservedContextTokens = 4096;
+// A compaction request needs to read the full conversation before it can produce its short summary.
+constexpr auto CompactionResponseTimeout = std::chrono::seconds(3600);
 
 std::size_t CompactionThreshold(std::size_t contextLength)
 {
@@ -70,6 +75,32 @@ std::string SelectedToolsSummary(const std::vector<LlamaToolCall>& toolCalls)
     return summary;
 }
 
+std::optional<std::string> UnproductiveObservationSignature(
+    const LlamaToolCall& call,
+    const json& toolResult)
+{
+    if (call.name != "get_nearby_entities" || !toolResult.value("ok", false))
+        return std::nullopt;
+
+    const auto result = toolResult.find("result");
+    if (result == toolResult.end() || !result->is_object())
+        return std::nullopt;
+    const auto entities = result->find("entities");
+    const auto position = result->find("player_position");
+    if (entities == result->end() || !entities->is_array() || !entities->empty() ||
+        position == result->end() || !position->is_object())
+    {
+        return std::nullopt;
+    }
+    const auto x = position->find("x");
+    const auto y = position->find("y");
+    if (x == position->end() || y == position->end() || !x->is_number() || !y->is_number())
+        return std::nullopt;
+
+    // Filters are deliberately excluded: swapping generic synonyms is still the same empty observation.
+    return call.name + "\n" + x->dump() + "," + y->dump();
+}
+
 constexpr const char* RocketSystemPrompt = R"(You are an autonomous Factorio player controlling one character through typed tools. Your only terminal objective is to launch a rocket.
 Interact with the game exclusively through real calls to the provided tool-calling interface. Until a tool result explicitly confirms that a rocket was launched, every response must contain at least one real tool call. Never return a plan, summary, explanation, table, JSON command, plain-text answer, or merely the name or description of a tool instead of invoking it. After a tool explicitly confirms the launch, stop and return only a concise final confirmation.
 After every tool result, immediately choose and invoke the next tool. Continue acting indefinitely across turns; observation, inventory inspection, planning, and intermediate milestones are never completion.
@@ -90,7 +121,7 @@ Advance through the smallest currently available milestone. Do not scale product
 Perform a reported research trigger only once, then recheck it. If the same trigger remains incomplete with no changed progress, do not craft or place duplicate trigger items; invoke a genuinely different diagnostic tool.
 Take one meaningful gameplay action at a time, then inspect its result. Use batch counts when a tool supports them instead of repeating the same action one unit at a time.
 Treat partial results and reported failure conditions as new observations: adapt the next action instead of blindly retrying.
-Avoid redundant polling and broad unfiltered queries. Use filters and pagination, and prefer a tool that waits for completion when one is available. While lab research is active, call wait_for_research once; never poll get_research_status across model turns.
+Avoid redundant polling and broad unfiltered queries. Use filters and pagination, and prefer a tool that waits for completion when one is available. For lab research, call wait_for_research only when the latest research status says research_wait_ready=true. If it is false, repair the reported lab_status power or science-pack blocker first, then recheck research status; never wait on an unpowered or non-working lab.
 Prioritize survival, power, resources, automation, science, defense, and rocket production. If uncertain, call the most relevant observation tool. If an action fails, inspect the state and try another valid action.
 Be proactive! Avoid just waiting - explore, gather, build, craft. Always have something to do. If nothing is nearby, MOVE to explore. If you have materials, CRAFT or PLACE. WAIT only when enemies are near or you're in danger.
 Factorio map X increases east and map Y increases south.
@@ -138,6 +169,114 @@ const char* RequiredTerminalEvidence(AgentRunMode mode)
         ? "return_to_task_issuer reporting task_terminal=true"
         : "a tool result explicitly confirming a rocket launch";
 }
+
+struct TerminalOutcome
+{
+    bool succeeded{};
+    std::string text;
+};
+
+std::optional<TerminalOutcome> TerminalOutcomeForGameResult(AgentRunMode mode, const json& gameResult)
+{
+    if (!gameResult.is_object())
+        return std::nullopt;
+    if (mode == AgentRunMode::LaunchRocket && gameResult.value("rocket_launch_confirmed", false))
+    {
+        return TerminalOutcome{
+            .succeeded = true,
+            .text = "Rocket launch confirmed by the game state.",
+        };
+    }
+    if (mode == AgentRunMode::LaunchRocket || !gameResult.value("task_terminal", false))
+        return std::nullopt;
+
+    const auto succeeded = gameResult.value("task_completed", false);
+    auto defaultMessage = std::string("The in-game task could not return to the issuer.");
+    if (succeeded)
+    {
+        defaultMessage = mode == AgentRunMode::BuildGhosts
+            ? "Ghost construction task completed and the agent returned to the issuer."
+            : "Deconstruction task completed and the agent returned to the issuer.";
+    }
+    return TerminalOutcome{
+        .succeeded = succeeded,
+        .text = gameResult.value("message", defaultMessage),
+    };
+}
+
+void ReportEvent(
+    const AgentController::EventHandler& event,
+    std::string kind,
+    int round,
+    json payload = json::object())
+{
+    if (event)
+        event({.kind = std::move(kind), .round = round, .payload = std::move(payload)});
+}
+
+void SaveCheckpoint(
+    const AgentController::StateHandler& stateChanged,
+    const AgentController::EventHandler& event,
+    const AgentRunState& state)
+{
+    if (stateChanged)
+        stateChanged(state);
+    ReportEvent(event, "state_checkpoint", state.completedRounds, {
+        {"message_count", state.messages.size()},
+        {"consecutive_invalid_terminal_turns", state.consecutiveInvalidTerminalTurns},
+        {"consecutive_identical_failed_tool_calls", state.consecutiveIdenticalFailedToolCalls},
+        {"consecutive_unproductive_observation_calls", state.consecutiveUnproductiveObservationCalls},
+    });
+}
+
+AgentRunState CheckpointWithUnconfirmedCalls(
+    const AgentRunState& state,
+    const std::vector<LlamaToolCall>& toolCalls,
+    std::size_t firstUnconfirmedCall)
+{
+    auto checkpoint = state;
+    for (auto index = firstUnconfirmedCall; index < toolCalls.size(); ++index)
+    {
+        const auto& call = toolCalls[index];
+        checkpoint.messages.push_back({
+            {"role", "tool"},
+            {"tool_call_id", call.id},
+            {"content", json({
+                {"ok", false},
+                {"error", "FactorIA saved this call before a confirmed game-side result was available. "
+                    "Its outcome is unknown after a restart."},
+                {"recovery", "Do not repeat this action blindly. Re-observe current game state, then choose "
+                    "a safe next action from the new evidence."},
+            }).dump()},
+        });
+    }
+    return checkpoint;
+}
+}
+
+std::string_view AgentRunModeName(AgentRunMode mode) noexcept
+{
+    switch (mode)
+    {
+    case AgentRunMode::LaunchRocket:
+        return "launch_rocket";
+    case AgentRunMode::BuildGhosts:
+        return "build_ghosts";
+    case AgentRunMode::RemoveMarkers:
+        return "remove_markers";
+    }
+    return "launch_rocket";
+}
+
+std::optional<AgentRunMode> AgentRunModeFromName(std::string_view name) noexcept
+{
+    if (name == "launch_rocket")
+        return AgentRunMode::LaunchRocket;
+    if (name == "build_ghosts")
+        return AgentRunMode::BuildGhosts;
+    if (name == "remove_markers")
+        return AgentRunMode::RemoveMarkers;
+    return std::nullopt;
 }
 
 AgentController::AgentController(LlamaClient llama, FactorioTools& tools)
@@ -150,8 +289,8 @@ AgentRunResult AgentController::Run(
     std::optional<int> maximumRounds,
     std::stop_token stopToken,
     AgentRunMode mode,
-    const TraceHandler& trace,
-    const DecisionHandler& decision) const
+    const std::optional<AgentRunState>& resumedState,
+    const RunCallbacks& callbacks) const
 {
     if (objective.empty())
         throw std::runtime_error("Agent objective cannot be empty");
@@ -161,10 +300,71 @@ AgentRunResult AgentController::Run(
             std::to_string(MinimumRounds) + " and " + std::to_string(MaximumRounds));
     }
 
-    json messages = json::array({
-        {{"role", "system"}, {"content", SystemPrompt(mode)}},
-        {{"role", "user"}, {"content", objective}},
-    });
+    AgentRunState state;
+    if (resumedState)
+    {
+        state = *resumedState;
+        if (state.mode != mode)
+            throw std::runtime_error("Saved agent state belongs to a different run mode");
+        if (state.objective != objective)
+            throw std::runtime_error("Saved agent state must resume its original objective");
+        if (!state.messages.is_array() || state.messages.size() < 2)
+            throw std::runtime_error("Saved agent state has no valid conversation context");
+
+        state.maximumRounds = maximumRounds;
+        if (state.terminalReached)
+        {
+            AgentRunResult result{
+                .finalText = state.terminalText,
+                .rounds = state.completedRounds,
+                .stopped = false,
+                .succeeded = state.terminalSucceeded,
+            };
+            ReportEvent(callbacks.event, "terminal_state_restored", state.completedRounds, {
+                {"succeeded", state.terminalSucceeded},
+                {"final_text", state.terminalText},
+            });
+            SaveCheckpoint(callbacks.stateChanged, callbacks.event, state);
+            return result;
+        }
+        state.messages.push_back({
+            {"role", "user"},
+            {"content", "This conversation was restored from a saved FactorIA state. Continue the original "
+                "objective, but re-observe all dynamic game state before taking the next action."},
+        });
+        ReportEvent(callbacks.event, "context_resumed", state.completedRounds, {
+            {"message_count", state.messages.size()},
+            {"mode", std::string(AgentRunModeName(mode))},
+        });
+    }
+    else
+    {
+        state = {
+            .objective = objective,
+            .mode = mode,
+            .maximumRounds = maximumRounds,
+            .completedRounds = 0,
+            .consecutiveInvalidTerminalTurns = 0,
+            .consecutiveIdenticalFailedToolCalls = 0,
+            .lastFailedToolCallSignature = {},
+            .consecutiveUnproductiveObservationCalls = 0,
+            .lastUnproductiveObservationSignature = {},
+            .terminalReached = false,
+            .terminalSucceeded = false,
+            .terminalText = {},
+            .messages = json::array({
+                {{"role", "system"}, {"content", SystemPrompt(mode)}},
+                {{"role", "user"}, {"content", objective}},
+            }),
+        };
+        ReportEvent(callbacks.event, "run_started", 0, {
+            {"objective", objective},
+            {"mode", std::string(AgentRunModeName(mode))},
+            {"maximum_rounds", maximumRounds ? json(*maximumRounds) : json(nullptr)},
+        });
+    }
+    SaveCheckpoint(callbacks.stateChanged, callbacks.event, state);
+    auto& messages = state.messages;
 
     LlamaModelCapabilities modelCapabilities;
     try
@@ -174,16 +374,16 @@ AgentRunResult AgentController::Run(
     catch (const std::exception& error)
     {
         // Catalog metadata should not block text-only gameplay.
-        if (trace)
-            trace("[MODEL CAPABILITIES] OpenRouter metadata unavailable: " + std::string(error.what()));
+        if (callbacks.trace)
+            callbacks.trace("[MODEL CAPABILITIES] OpenRouter metadata unavailable: " + std::string(error.what()));
     }
     const auto toolDefinitions = tools_.Definitions(modelCapabilities.supportsImageInput);
     const auto promptTokenCompactionThreshold = modelCapabilities.contextLength
         ? CompactionThreshold(*modelCapabilities.contextLength)
         : LocalPromptTokenCompactionThreshold;
-    if (trace)
+    if (callbacks.trace)
     {
-        trace("[MODEL CAPABILITIES] Context limit: " +
+        callbacks.trace("[MODEL CAPABILITIES] Context limit: " +
             (modelCapabilities.contextLength
                 ? std::to_string(*modelCapabilities.contextLength) + " tokens"
                 : std::string("unknown")) +
@@ -191,26 +391,37 @@ AgentRunResult AgentController::Run(
     }
 
     AgentRunResult result;
-    int consecutiveInvalidTerminalTurns = 0;
-    int consecutiveIdenticalFailedToolCalls = 0;
-    std::string lastFailedToolCallSignature;
     bool terminalReached = false;
-    for (int round = 1; !maximumRounds || round <= *maximumRounds; ++round)
+    for (int invocationRound = 1; !maximumRounds || invocationRound <= *maximumRounds; ++invocationRound)
     {
         if (stopToken.stop_requested())
         {
             result.stopped = true;
+            SaveCheckpoint(callbacks.stateChanged, callbacks.event, state);
+            ReportEvent(callbacks.event, "run_stopped", state.completedRounds);
             return result;
         }
 
-        result.rounds = round;
-        if (trace)
+        ++state.completedRounds;
+        result.rounds = invocationRound;
+        ReportEvent(callbacks.event, "round_started", state.completedRounds, {
+            {"invocation_round", invocationRound},
+            {"maximum_rounds", maximumRounds ? json(*maximumRounds) : json(nullptr)},
+        });
+        // Persist the new round before waiting on the provider so a manual save or restart sees current context.
+        SaveCheckpoint(callbacks.stateChanged, callbacks.event, state);
+        if (callbacks.trace)
         {
-            trace("========== AGENT ROUND " + std::to_string(round) +
+            callbacks.trace("========== AGENT ROUND " + std::to_string(invocationRound) +
                 (maximumRounds ? " OF " + std::to_string(*maximumRounds) : " (NON-STOP)") +
                 " ==========");
         }
-        auto turn = llama_.Complete(messages, toolDefinitions, trace);
+        auto turn = llama_.Complete(messages, toolDefinitions, callbacks.trace, callbacks.completion);
+        ReportEvent(callbacks.event, "model_turn", state.completedRounds, {
+            {"finish_reason", turn.finishReason},
+            {"prompt_tokens", turn.promptTokens},
+            {"assistant_message", turn.assistantMessage},
+        });
         messages.push_back(turn.assistantMessage);
 
         if (!turn.toolCalls.empty())
@@ -219,28 +430,29 @@ AgentRunResult AgentController::Run(
             const auto summary = visibleDecision.empty()
                 ? SelectedToolsSummary(turn.toolCalls)
                 : visibleDecision;
-            if (trace)
-                trace("[MODEL DECISION] " + summary);
-            if (decision)
-                decision(summary);
+            if (callbacks.trace)
+                callbacks.trace("[MODEL DECISION] " + summary);
+            if (callbacks.decision)
+                callbacks.decision(summary);
         }
 
         if (turn.toolCalls.empty())
         {
-            ++consecutiveInvalidTerminalTurns;
-            if (consecutiveInvalidTerminalTurns >= MaximumConsecutiveInvalidTerminalTurns)
+            ++state.consecutiveInvalidTerminalTurns;
+            if (state.consecutiveInvalidTerminalTurns >= MaximumConsecutiveInvalidTerminalTurns)
             {
+                SaveCheckpoint(callbacks.stateChanged, callbacks.event, state);
                 throw std::runtime_error("AI model returned " +
                     std::to_string(MaximumConsecutiveInvalidTerminalTurns) +
                     " consecutive responses without a required tool call before " +
                     RequiredTerminalEvidence(mode));
             }
-            if (trace)
+            if (callbacks.trace)
             {
-                trace("[MODEL RETRY] " + std::string(turn.content.empty() ? "Empty" : "Terminal") +
+                callbacks.trace("[MODEL RETRY] " + std::string(turn.content.empty() ? "Empty" : "Terminal") +
                     " response before " + RequiredTerminalEvidence(mode) +
                     (turn.finishReason.empty() ? std::string{} : " (finish: " + turn.finishReason + ")") +
-                    "; requiring a tool call (" + std::to_string(consecutiveInvalidTerminalTurns) + " of " +
+                    "; requiring a tool call (" + std::to_string(state.consecutiveInvalidTerminalTurns) + " of " +
                     std::to_string(MaximumConsecutiveInvalidTerminalTurns - 1) + ")");
             }
             messages.push_back({
@@ -249,40 +461,68 @@ AgentRunResult AgentController::Run(
                     std::string(RequiredTerminalEvidence(mode)) + ". Plain-text terminal responses are not "
                     "allowed. Invoke the next real gameplay or observation tool now."},
             });
+            ReportEvent(callbacks.event, "terminal_response_rejected", state.completedRounds, {
+                {"finish_reason", turn.finishReason},
+                {"content", turn.content},
+            });
+            SaveCheckpoint(callbacks.stateChanged, callbacks.event, state);
             continue;
         }
 
-        consecutiveInvalidTerminalTurns = 0;
+        state.consecutiveInvalidTerminalTurns = 0;
 
         std::vector<std::string> imageDataUrls;
         bool repeatedFailedToolCallNeedsCorrection = false;
         std::string repeatedFailedToolCallError;
-        for (const auto& call : turn.toolCalls)
+        bool unproductiveObservationNeedsCorrection = false;
+        std::string unproductiveObservationError;
+        bool toolExecutionStopped = false;
+        for (std::size_t callIndex = 0; callIndex < turn.toolCalls.size(); ++callIndex)
         {
+            const auto& call = turn.toolCalls[callIndex];
+            ReportEvent(callbacks.event, "tool_call", state.completedRounds, {
+                {"tool_call_id", call.id},
+                {"name", call.name},
+                {"arguments", call.arguments},
+            });
+            if (callbacks.trace)
+            {
+                callbacks.trace("[TOOL CALL] " + call.name + "\nArguments:\n" + call.arguments.dump(2));
+            }
+            ReportEvent(callbacks.event, "tool_dispatch_prepared", state.completedRounds, {
+                {"tool_call_id", call.id},
+                {"name", call.name},
+            });
+            SaveCheckpoint(
+                callbacks.stateChanged,
+                callbacks.event,
+                CheckpointWithUnconfirmedCalls(state, turn.toolCalls, callIndex));
+            json toolResult;
             if (stopToken.stop_requested())
             {
-                result.stopped = true;
-                return result;
-            }
-
-            if (trace)
-            {
-                trace("[TOOL CALL] " + call.name + "\nArguments:\n" + call.arguments.dump(2));
-            }
-            json toolResult;
-            try
-            {
-                toolResult = {{"ok", true}, {"result", tools_.Execute(call.name, call.arguments, stopToken)}};
-            }
-            catch (const std::exception& error)
-            {
+                toolExecutionStopped = true;
                 toolResult = {
                     {"ok", false},
-                    {"error", error.what()},
-                    {"recovery", "Do not repeat this failed call unchanged. Re-read the tool schema and "
-                        "latest discovery results, use only exact returned identifiers, and omit unknown "
-                        "optional arguments instead of sending empty strings or null."},
+                    {"error", "Tool execution was cancelled before it was sent to Factorio."},
+                    {"recovery", "Re-observe the game state before choosing a replacement action."},
                 };
+            }
+            else
+            {
+                try
+                {
+                    toolResult = {{"ok", true}, {"result", tools_.Execute(call.name, call.arguments, stopToken)}};
+                }
+                catch (const std::exception& error)
+                {
+                    toolResult = {
+                        {"ok", false},
+                        {"error", error.what()},
+                        {"recovery", "Do not repeat this failed call unchanged. Re-read the tool schema and "
+                            "latest discovery results, use only exact returned identifiers, and omit unknown "
+                            "optional arguments instead of sending empty strings or null."},
+                    };
+                }
             }
             std::string imageDataUrl;
             if (toolResult.value("ok", false) && toolResult["result"].is_object())
@@ -295,61 +535,83 @@ AgentRunResult AgentController::Run(
                     toolResult["result"]["image_attached"] = true;
                 }
             }
-            if (trace)
+            if (callbacks.trace)
             {
-                trace("[TOOL RESULT] " + call.name + "\n" + toolResult.dump(2));
+                callbacks.trace("[TOOL RESULT] " + call.name + "\n" + toolResult.dump(2));
             }
-            if (!toolResult.value("ok", false))
+            if (!toolExecutionStopped && !toolResult.value("ok", false))
             {
                 const auto signature = call.name + "\n" + call.arguments.dump();
-                if (signature == lastFailedToolCallSignature)
+                if (signature == state.lastFailedToolCallSignature)
                 {
-                    ++consecutiveIdenticalFailedToolCalls;
+                    ++state.consecutiveIdenticalFailedToolCalls;
                 }
                 else
                 {
-                    lastFailedToolCallSignature = signature;
-                    consecutiveIdenticalFailedToolCalls = 1;
+                    state.lastFailedToolCallSignature = signature;
+                    state.consecutiveIdenticalFailedToolCalls = 1;
                 }
 
-                repeatedFailedToolCallNeedsCorrection = consecutiveIdenticalFailedToolCalls >= 2;
-                if (consecutiveIdenticalFailedToolCalls >= MaximumConsecutiveIdenticalFailedToolCalls)
+                repeatedFailedToolCallNeedsCorrection = state.consecutiveIdenticalFailedToolCalls >= 2;
+                if (state.consecutiveIdenticalFailedToolCalls >= MaximumConsecutiveIdenticalFailedToolCalls)
                 {
                     repeatedFailedToolCallError = "AI model repeated the identical failed tool call " +
-                        call.name + " " + std::to_string(consecutiveIdenticalFailedToolCalls) +
+                        call.name + " " + std::to_string(state.consecutiveIdenticalFailedToolCalls) +
                         " consecutive times: " + toolResult.value("error", "unknown tool error");
                 }
             }
-            else
+            else if (!toolExecutionStopped)
             {
-                consecutiveIdenticalFailedToolCalls = 0;
-                lastFailedToolCallSignature.clear();
+                state.consecutiveIdenticalFailedToolCalls = 0;
+                state.lastFailedToolCallSignature.clear();
                 repeatedFailedToolCallNeedsCorrection = false;
                 repeatedFailedToolCallError.clear();
+            }
+            if (!toolExecutionStopped)
+            {
+                if (const auto signature = UnproductiveObservationSignature(call, toolResult))
+                {
+                    if (*signature == state.lastUnproductiveObservationSignature)
+                    {
+                        ++state.consecutiveUnproductiveObservationCalls;
+                    }
+                    else
+                    {
+                        state.lastUnproductiveObservationSignature = *signature;
+                        state.consecutiveUnproductiveObservationCalls = 1;
+                    }
+
+                    unproductiveObservationNeedsCorrection =
+                        state.consecutiveUnproductiveObservationCalls >=
+                        UnproductiveObservationCorrectionThreshold;
+                    if (state.consecutiveUnproductiveObservationCalls >=
+                        MaximumConsecutiveUnproductiveObservationCalls)
+                    {
+                        unproductiveObservationError =
+                            "AI model made " +
+                            std::to_string(state.consecutiveUnproductiveObservationCalls) +
+                            " consecutive empty get_nearby_entities calls without moving";
+                    }
+                }
+                else
+                {
+                    state.consecutiveUnproductiveObservationCalls = 0;
+                    state.lastUnproductiveObservationSignature.clear();
+                    unproductiveObservationNeedsCorrection = false;
+                    unproductiveObservationError.clear();
+                }
             }
             if (toolResult.value("ok", false) && toolResult["result"].is_object())
             {
                 const auto& gameResult = toolResult["result"];
-                if (mode == AgentRunMode::LaunchRocket && gameResult.value("rocket_launch_confirmed", false))
+                if (const auto outcome = TerminalOutcomeForGameResult(mode, gameResult))
                 {
                     terminalReached = true;
-                    result.succeeded = true;
-                    result.finalText = "Rocket launch confirmed by the game state.";
-                }
-                else if (mode != AgentRunMode::LaunchRocket && gameResult.value("task_terminal", false))
-                {
-                    terminalReached = true;
-                    result.succeeded = gameResult.value("task_completed", false);
-                    auto defaultMessage = std::string("The in-game task could not return to the issuer.");
-                    if (result.succeeded)
-                    {
-                        defaultMessage = mode == AgentRunMode::BuildGhosts
-                            ? "Ghost construction task completed and the agent returned to the issuer."
-                            : "Deconstruction task completed and the agent returned to the issuer.";
-                    }
-                    result.finalText = gameResult.value(
-                        "message",
-                        defaultMessage);
+                    result.succeeded = outcome->succeeded;
+                    result.finalText = outcome->text;
+                    state.terminalReached = true;
+                    state.terminalSucceeded = outcome->succeeded;
+                    state.terminalText = outcome->text;
                 }
             }
             messages.push_back({
@@ -359,7 +621,17 @@ AgentRunResult AgentController::Run(
             });
             if (!imageDataUrl.empty())
                 imageDataUrls.push_back(std::move(imageDataUrl));
+            SaveCheckpoint(
+                callbacks.stateChanged,
+                callbacks.event,
+                CheckpointWithUnconfirmedCalls(state, turn.toolCalls, callIndex + 1));
+            ReportEvent(callbacks.event, "tool_result", state.completedRounds, {
+                {"tool_call_id", call.id},
+                {"name", call.name},
+                {"result", toolResult},
+            });
         }
+        const auto attachedImages = !imageDataUrls.empty();
         for (auto& imageDataUrl : imageDataUrls)
         {
             messages.push_back({
@@ -370,11 +642,33 @@ AgentRunResult AgentController::Run(
                 })},
             });
         }
+        if (attachedImages)
+            SaveCheckpoint(callbacks.stateChanged, callbacks.event, state);
+        if (toolExecutionStopped)
+        {
+            result.stopped = true;
+            SaveCheckpoint(callbacks.stateChanged, callbacks.event, state);
+            ReportEvent(callbacks.event, "run_stopped", state.completedRounds);
+            return result;
+        }
         if (!repeatedFailedToolCallError.empty())
         {
-            if (trace)
-                trace("[AGENT LOOP GUARD] " + repeatedFailedToolCallError);
+            SaveCheckpoint(callbacks.stateChanged, callbacks.event, state);
+            if (callbacks.trace)
+                callbacks.trace("[AGENT LOOP GUARD] " + repeatedFailedToolCallError);
             throw std::runtime_error(repeatedFailedToolCallError);
+        }
+        if (!unproductiveObservationError.empty())
+        {
+            SaveCheckpoint(callbacks.stateChanged, callbacks.event, state);
+            ReportEvent(callbacks.event, "loop_guard_triggered", state.completedRounds, {
+                {"reason", "unproductive_observation"},
+                {"tool", "get_nearby_entities"},
+                {"consecutive_calls", state.consecutiveUnproductiveObservationCalls},
+            });
+            if (callbacks.trace)
+                callbacks.trace("[AGENT LOOP GUARD] " + unproductiveObservationError);
+            throw std::runtime_error(unproductiveObservationError);
         }
         if (repeatedFailedToolCallNeedsCorrection)
         {
@@ -385,8 +679,29 @@ AgentRunResult AgentController::Run(
                     "the provided schema or choose a different applicable tool."},
             });
         }
+        if (unproductiveObservationNeedsCorrection)
+        {
+            const auto correction =
+                "You have made " + std::to_string(state.consecutiveUnproductiveObservationCalls) +
+                " consecutive empty get_nearby_entities calls without moving. Changing regex synonyms is "
+                "not progress. Do not call get_nearby_entities again from this position with another guessed "
+                "filter. If exact nearby prototypes were returned, use those exact identifiers; otherwise "
+                "move to explore or choose a different applicable tool before scanning again.";
+            messages.push_back({{"role", "user"}, {"content", correction}});
+            ReportEvent(callbacks.event, "loop_correction", state.completedRounds, {
+                {"reason", "unproductive_observation"},
+                {"tool", "get_nearby_entities"},
+                {"consecutive_calls", state.consecutiveUnproductiveObservationCalls},
+                {"message", correction},
+            });
+            if (callbacks.trace)
+                callbacks.trace("[AGENT LOOP CORRECTION] " + correction);
+        }
         if (terminalReached)
+        {
+            SaveCheckpoint(callbacks.stateChanged, callbacks.event, state);
             return result;
+        }
 
         const auto estimatedPromptTokens = turn.promptTokens == 0
             ? EstimatePromptTokens(messages, toolDefinitions)
@@ -396,12 +711,18 @@ AgentRunResult AgentController::Run(
         {
             const auto previousMessageCount = messages.size();
             const auto compactionMeasurement = turn.promptTokens == 0 ? "estimated" : "provider-reported";
-            if (trace)
+            if (callbacks.trace)
             {
-                trace("[CONTEXT COMPACTION] Summarizing " + std::to_string(previousMessageCount) +
+                callbacks.trace("[CONTEXT COMPACTION] Summarizing " + std::to_string(previousMessageCount) +
                     " messages at " + std::to_string(promptTokens) + " " + compactionMeasurement +
-                    " prompt tokens; threshold " + std::to_string(promptTokenCompactionThreshold));
+                " prompt tokens; threshold " + std::to_string(promptTokenCompactionThreshold));
             }
+            ReportEvent(callbacks.event, "context_compaction_started", state.completedRounds, {
+                {"previous_message_count", previousMessageCount},
+                {"prompt_tokens", promptTokens},
+                {"measurement", compactionMeasurement},
+                {"response_timeout_seconds", CompactionResponseTimeout.count()},
+            });
 
             auto summaryMessages = messages;
             summaryMessages.at(0)["content"] = CompactionSystemPrompt;
@@ -418,7 +739,12 @@ AgentRunResult AgentController::Run(
             std::string summary;
             for (int attempt = 1; attempt <= MaximumCompactionAttempts && summary.empty(); ++attempt)
             {
-                auto summaryTurn = llama_.Complete(summaryMessages, json::array(), trace);
+                auto summaryTurn = llama_.Complete(
+                    summaryMessages,
+                    json::array(),
+                    callbacks.trace,
+                    callbacks.completion,
+                    {.responseTimeout = CompactionResponseTimeout});
                 if (summaryTurn.toolCalls.empty())
                     summary = std::move(summaryTurn.content);
                 if (!summary.empty())
@@ -445,14 +771,21 @@ AgentRunResult AgentController::Run(
                 {{"role", "user"}, {"content", "Continue the original objective from this summary. Re-observe "
                     "dynamic game state before relying on values that may have changed."}},
             });
-            if (trace)
+            if (callbacks.trace)
             {
-                trace("[CONTEXT COMPACTION] Replaced " + std::to_string(previousMessageCount) +
+                callbacks.trace("[CONTEXT COMPACTION] Replaced " + std::to_string(previousMessageCount) +
                     " messages with " + std::to_string(messages.size()) + " compact messages");
             }
+            ReportEvent(callbacks.event, "context_compacted", state.completedRounds, {
+                {"previous_message_count", previousMessageCount},
+                {"message_count", messages.size()},
+            });
         }
+        SaveCheckpoint(callbacks.stateChanged, callbacks.event, state);
     }
 
+    SaveCheckpoint(callbacks.stateChanged, callbacks.event, state);
+    ReportEvent(callbacks.event, "run_limit_reached", state.completedRounds);
     throw std::runtime_error("Agent stopped after reaching the configured maximum rounds");
 }
 }

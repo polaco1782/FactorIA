@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <optional>
@@ -41,6 +42,28 @@ struct OpenRouterKeyUsage
     bool isFreeTier{};
 };
 
+struct LlamaCompletionEvent
+{
+    enum class Kind
+    {
+        Request,
+        Attempt,
+        Response,
+        Retry,
+        Failure,
+    };
+
+    Kind kind{};
+    // Request is emitted once per logical completion with attempt zero.
+    int attempt{};
+    nlohmann::json payload;
+};
+
+struct LlamaCompletionOptions
+{
+    std::chrono::seconds responseTimeout{60};
+};
+
 class LlamaClient
 {
 public:
@@ -52,6 +75,7 @@ public:
 
     using TraceHandler = std::function<void(const std::string&)>;
     using RequestHandler = std::function<void(RequestEvent)>;
+    using CompletionObserver = std::function<void(const LlamaCompletionEvent&)>;
 
     LlamaClient(
         std::string baseUrl,
@@ -66,7 +90,9 @@ public:
     LlamaTurn Complete(
         const nlohmann::json& messages,
         const nlohmann::json& tools,
-        const TraceHandler& trace = {}) const;
+        const TraceHandler& trace = {},
+        const CompletionObserver& observer = {},
+        LlamaCompletionOptions options = {}) const;
 
 private:
     struct Endpoint

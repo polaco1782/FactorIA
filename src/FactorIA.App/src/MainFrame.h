@@ -9,11 +9,13 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <wx/frame.h>
 
 #include <FactorIA/AppSettings.h>
 #include <FactorIA/AgentController.h>
+#include <FactorIA/AgentHistoryDatabase.h>
 #include <FactorIA/LlamaClient.h>
 #include <FactorIA/RconClient.h>
 #include <FactorIA/WebControlServer.h>
@@ -21,6 +23,7 @@
 class wxButton;
 class wxCheckBox;
 class wxChoice;
+class wxGrid;
 class wxNotebook;
 class wxSpinCtrl;
 class wxStaticText;
@@ -53,7 +56,39 @@ private:
     void TestLlama();
     void FetchOpenRouterModels();
     void RunAgent();
+    void SaveAgentState();
+    void ResumeSavedState();
+    void ResumeSelectedDatabaseState();
+    [[nodiscard]] bool PrepareResume(const AgentSessionCheckpoint& checkpoint);
+    void RefreshDatabaseView();
+    void ShowDatabaseSession(std::size_t index);
+    void LoadOlderDatabaseEvents();
+    void RenderDatabaseSession(const AgentSessionSummary& session);
+    void UpdatePersistenceControls();
+    void SaveHistoryCheckpoint(std::int64_t sessionId, const AgentRunState& state);
+    void RecordHistoryEvent(std::int64_t sessionId, int round, std::string kind, nlohmann::json payload);
+    void FinishHistorySession(
+        std::int64_t sessionId,
+        std::string status,
+        std::string finalText = {},
+        std::string errorText = {});
+    void ReportHistoryError(std::string action, std::string message);
+    [[nodiscard]] FactorioTools::BridgeEventHandler CreateBridgeHistoryHandler(
+        std::int64_t sessionId,
+        std::shared_ptr<std::atomic<int>> activeRound);
+    [[nodiscard]] AgentController::RunCallbacks CreateAgentRunCallbacks(
+        std::int64_t sessionId,
+        std::shared_ptr<std::atomic<int>> activeRound,
+        FactorioTools& tools);
     void RunAgentTaskUpdates(std::stop_token stopToken);
+    void ConfigureInventoryRefresh();
+    void RunInventoryUpdates(std::stop_token stopToken);
+    void ApplyInventorySnapshot(
+        std::uint64_t revision,
+        std::vector<WebInventoryItem> items,
+        bool available,
+        std::string status);
+    void RenderInventory();
     void QueueAgentTask(FactorioAgentTask task);
     void StartAgentTask(FactorioAgentTask task);
     void StopAgent();
@@ -78,12 +113,37 @@ private:
     bool workActive_{};
     bool rconConnected_{};
     std::unique_ptr<WebControlServer> webControlServer_;
+    std::unique_ptr<AgentHistoryDatabase> historyDatabase_;
+    std::optional<AgentSessionCheckpoint> pendingResumeCheckpoint_;
+    std::optional<std::int64_t> activeSessionId_;
+    std::optional<std::int64_t> lastSessionId_;
+    std::atomic<std::int64_t> latestCheckpointSessionId_{};
+    std::vector<AgentSessionSummary> databaseSessions_;
+    std::vector<AgentHistoryEvent> databaseEvents_;
+    std::optional<std::int64_t> displayedDatabaseSessionId_;
+    bool databaseHasOlderEvents_{};
+    std::atomic_bool historyErrorReported_{};
 
     std::mutex agentTaskWaitMutex_;
     std::condition_variable_any agentTaskChanged_;
     std::atomic_bool agentTaskDispatchPending_{};
     std::optional<FactorioAgentTask> pendingAgentTask_;
     std::jthread agentTaskWorker_;
+
+    struct InventoryRefreshRequest
+    {
+        bool enabled{};
+        bool useDedicatedCharacter{};
+        std::uint64_t revision{};
+    };
+
+    std::mutex inventoryRefreshMutex_;
+    std::condition_variable_any inventoryRefreshChanged_;
+    InventoryRefreshRequest inventoryRefreshRequest_;
+    std::jthread inventoryWorker_;
+    std::vector<WebInventoryItem> inventoryItems_;
+    std::string inventoryStatus_{"Not connected"};
+    bool inventoryAvailable_{};
 
     struct OpenRouterStatusRequest
     {
@@ -122,8 +182,19 @@ private:
     wxCheckBox* nonStopAgentRun_{};
     wxButton* agentRunButton_{};
     wxButton* agentStopButton_{};
+    wxButton* saveAgentStateButton_{};
+    wxButton* resumeSavedStateButton_{};
     wxStaticText* agentStatus_{};
     wxTextCtrl* modelDecisions_{};
     wxTextCtrl* log_{};
+    wxStaticText* inventoryStatusLabel_{};
+    wxButton* refreshInventoryButton_{};
+    wxGrid* inventoryGrid_{};
+    wxStaticText* databasePath_{};
+    wxChoice* databaseSessionChoice_{};
+    wxButton* refreshDatabaseButton_{};
+    wxButton* resumeDatabaseSessionButton_{};
+    wxButton* loadOlderDatabaseEventsButton_{};
+    wxTextCtrl* databaseView_{};
 };
 }

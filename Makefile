@@ -19,6 +19,7 @@ TARGET := $(BIN_DIR)/factoria-$(BUILD)
 # Keep this source list in sync with FactorIA.App.vcxproj.
 SOURCES := \
     $(SRC_DIR)/AgentController.cpp \
+    $(SRC_DIR)/AgentHistoryDatabase.cpp \
     $(SRC_DIR)/AppSettings.cpp \
     $(SRC_DIR)/FactorioTools.cpp \
     $(SRC_DIR)/LlamaClient.cpp \
@@ -60,8 +61,8 @@ VCPKG_PKG_CONFIG_PATH := $(VCPKG_LIB_DIR)/pkgconfig:$(VCPKG_PREFIX)/share/pkgcon
 # Expand these in the recipe after the order-only deps prerequisite has run.
 WX_CXXFLAGS = $$("$(WX_CONFIG)" --cxxflags)
 WX_LIBS = $$("$(WX_CONFIG)" --libs)
-VCPKG_LIBS = $$(PKG_CONFIG_PATH="$(VCPKG_PKG_CONFIG_PATH)" \
-    "$(PKG_CONFIG)" --static --libs openssl)
+VCPKG_LIBS = $$(PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$(VCPKG_PKG_CONFIG_PATH)" \
+    "$(PKG_CONFIG)" --static --libs openssl sqlite3)
 
 ifeq ($(STRICT),1)
 CXXFLAGS += -Werror

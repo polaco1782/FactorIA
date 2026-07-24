@@ -32,6 +32,15 @@ function inspection.optional_property(entity, name)
     return nil
 end
 
+function inspection.status_name(entity)
+    local status = inspection.optional_property(entity, "status")
+    if status == nil then return nil end
+    for name, value in pairs(defines.entity_status) do
+        if value == status then return name end
+    end
+    return nil
+end
+
 local function entity_references(entities)
     local result = {}
     for _, entity in pairs(entities or {}) do
@@ -310,14 +319,7 @@ function inspection.get_nearby_entities(player, arguments)
             reachable = player.can_reach_entity(entity),
             prototype_count_in_radius = counts[entity.name]
         }
-        if entity.status then
-            for name, value in pairs(defines.entity_status) do
-                if value == entity.status then
-                    info.status = name
-                    break
-                end
-            end
-        end
+        info.status = inspection.status_name(entity)
         if entity.type == "resource" then
             info.amount = entity.amount
         elseif entity.type == "container" or entity.type == "logistic-container" then

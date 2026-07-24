@@ -9,7 +9,7 @@
     },
     "nlohmann-json",
     "openssl",
+    "sqlite3",
     "wxwidgets"
   ]
 }
-

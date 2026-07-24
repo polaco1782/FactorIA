@@ -30,11 +30,30 @@ class FactorioTools
 public:
     using CommandExecutor = std::function<std::string(const std::string&)>;
 
+    struct BridgeCommandEvent
+    {
+        enum class Kind
+        {
+            Sent,
+            Received,
+            Failed,
+        };
+
+        Kind kind{Kind::Sent};
+        std::string operation;
+        std::string command;
+        std::string response;
+        std::string error;
+    };
+
+    using BridgeEventHandler = std::function<void(const BridgeCommandEvent&)>;
+
     FactorioTools(
         CommandExecutor executeCommand,
         std::filesystem::path factorioUserDataPath,
         bool useDedicatedCharacter = false,
-        std::optional<FactorioAgentTask> agentTask = std::nullopt);
+        std::optional<FactorioAgentTask> agentTask = std::nullopt,
+        BridgeEventHandler bridgeEvent = {});
 
     [[nodiscard]] nlohmann::json Definitions(bool includeScreenshot = true) const;
     [[nodiscard]] nlohmann::json GetBridgeStatus() const;
@@ -104,6 +123,7 @@ private:
     std::filesystem::path factorioUserDataPath_;
     bool useDedicatedCharacter_{};
     std::optional<FactorioAgentTask> agentTask_;
+    BridgeEventHandler bridgeEvent_;
     nlohmann::json definitions_;
 };
 }

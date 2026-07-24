@@ -5,9 +5,17 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace factoria
 {
+struct WebInventoryItem
+{
+    std::string name;
+    std::int64_t count{};
+    std::string quality;
+};
+
 struct WebControlState
 {
     bool connected{};
@@ -17,6 +25,9 @@ struct WebControlState
     std::string objective;
     int maximumRounds{12};
     bool nonStop{};
+    bool inventoryAvailable{};
+    std::string inventoryStatus{"Not connected"};
+    std::vector<WebInventoryItem> inventory;
 };
 
 struct WebControlCommand
